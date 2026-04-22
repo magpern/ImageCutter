@@ -10,7 +10,7 @@ import sys
 import tkinter as tk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional, Tuple
+from typing import AbstractSet, Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageTk
 
@@ -127,13 +127,17 @@ def export_tiles(
     file_format: str = "png",
     transparent_circle_cutout: bool = False,
     save_options: Optional[SaveExportOptions] = None,
+    ignored: Optional[AbstractSet[Tuple[int, int]]] = None,
 ) -> int:
     eff = _effective_format_for_saving(file_format, transparent_circle_cutout)
     ext = _export_ext_for_format(eff)
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(basename or "image")[0]
+    skip: AbstractSet[Tuple[int, int]] = ignored or frozenset()
     count = 0
     for tile, r, c in compute_tiles(image, vertical, horizontal):
+        if (r, c) in skip:
+            continue
         out = tile
         if transparent_circle_cutout and CIRCLE_EXTRACT_OK:
             t2 = extract_circle_rgba(tile)
@@ -274,6 +278,44 @@ def get_tile_at_pixel(
             if xs0 <= ix < xs1 and ys0 <= iy < ys1:
                 return (im.crop((xs0, ys0, xs1, ys1)), r, c)
     return None
+
+
+def list_tile_rects(
+    im: Image.Image,
+    v: List[int],
+    h: List[int],
+    montage_table: bool,
+    nrows: int,
+    ncols: int,
+) -> List[Tuple[Tuple[int, int, int, int], int, int]]:
+    """Each ((x0,y0,x1,y1) image px), row, col) — same cell partition as get_tile_at_pixel."""
+    w, h_ = im.size
+    exb: List[Tuple[int, int]] = []
+    eyb: List[Tuple[int, int]] = []
+    if (
+        montage_table
+        and nrows >= 1
+        and ncols >= 1
+        and len(v) == _expected_gutter_line_count(ncols)
+        and len(h) == _expected_gutter_line_count(nrows)
+    ):
+        exb, eyb, ok = _montage_cell_bands(w, h_, nrows, ncols, sorted(v), sorted(h))
+        if not ok or not exb or not eyb:
+            exb, eyb = [], []
+    if not exb:
+        if not v and not h:
+            return [((0, 0, w, h_), 0, 0)]
+        xs = sorted([0] + [x for x in v if 0 < x < w] + [w])
+        ys = sorted([0] + [y for y in h if 0 < y < h_] + [h_])
+        exb = list(zip(xs, xs[1:]))
+        eyb = list(zip(ys, ys[1:]))
+    out: List[Tuple[Tuple[int, int, int, int], int, int]] = []
+    for r, (ys0, ys1) in enumerate(eyb):
+        for c, (xs0, xs1) in enumerate(exb):
+            if xs1 <= xs0 or ys1 <= ys0:
+                continue
+            out.append(((xs0, ys0, xs1, ys1), r, c))
+    return out
 
 
 def _scale_gutter_pair(
@@ -445,13 +487,17 @@ def export_tiles_montage(
     file_format: str = "png",
     transparent_circle_cutout: bool = False,
     save_options: Optional[SaveExportOptions] = None,
+    ignored: Optional[AbstractSet[Tuple[int, int]]] = None,
 ) -> int:
     eff = _effective_format_for_saving(file_format, transparent_circle_cutout)
     ext = _export_ext_for_format(eff)
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(basename or "image")[0]
+    skip: AbstractSet[Tuple[int, int]] = ignored or frozenset()
     n = 0
     for tile, r, c in compute_tiles_montage(image, vertical, horizontal, nrows, ncols):
+        if (r, c) in skip:
+            continue
         out = tile
         if transparent_circle_cutout and CIRCLE_EXTRACT_OK:
             t2 = extract_circle_rgba(tile)
@@ -489,7 +535,8 @@ class ImageSplitApp:
         self._img_y0: float = 0.0
         self.v_lines: List[int] = []
         self.h_lines: List[int] = []
-        self.mode = tk.StringVar(value="v")  # v, h, move, delete, circle
+        self.mode = tk.StringVar(value="v")  # v, h, move, delete, circle, ignore
+        self.ignored_cells: Set[Tuple[int, int]] = set()
         # (kind, current x or y in image space) — which line is being moved
         self._drag: Optional[Tuple[str, int]] = None
         self._path: Optional[str] = None
@@ -532,6 +579,7 @@ class ImageSplitApp:
             label="Auto grid (white gap table)…", command=self._auto_montage_gutters
         )
         tools_menu.add_command(label="Clear lines", command=self._clear_lines)
+        tools_menu.add_command(label="Clear ignored tiles", command=self._clear_ignored)
         help_menu = tk.Menu(mbar, tearoff=0)
         mbar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="About Image Split", command=self._about)
@@ -557,7 +605,8 @@ class ImageSplitApp:
             "The Auto grid (table size in the toolbar) finds full-span light gaps. "
             "Use the View and Tools menus, or the toolbar: export format (PNG, JPEG, WebP) "
             "and quality or PNG compression, remembered separately per format. "
-            "Single circle exports use the PNG compression value.",
+            "Single circle exports use the PNG compression value. "
+            "Use Ignore tile (click cell) to mark tiles you do not want exported; they are hatched in the view.",
         )
 
     def _quit(self) -> None:
@@ -604,6 +653,9 @@ class ImageSplitApp:
         ).pack(side=tk.LEFT, padx=2)
         ttk.Radiobutton(
             bar, text="Extract circle (click cell)", variable=self.mode, value="circle"
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(
+            bar, text="Ignore tile (click cell)", variable=self.mode, value="ignore"
         ).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(bar, text="Clear lines", command=self._clear_lines).pack(side=tk.LEFT, padx=4)
@@ -859,6 +911,59 @@ class ImageSplitApp:
             x0, x1 = self._ox, self._ox + w * self.scale
             self.canvas.create_line(x0, y0, x1, y1, width=2, fill=color_h, tags=("line", f"h{iy}"))
 
+        self._prune_ignored_cells()
+        for (x0, y0, x1, y1), r, c in list_tile_rects(
+            self.pil_image,
+            self.v_lines,
+            self.h_lines,
+            self.montage_table and self._montage_gutter_shape_ok(),
+            self.montage_nrows,
+            self.montage_ncols,
+        ):
+            if (r, c) not in self.ignored_cells:
+                continue
+            cx0 = self._ix_to_cx(x0)
+            cy0 = self._iy_to_cy(y0)
+            cx1 = self._ix_to_cx(x1)
+            cy1 = self._iy_to_cy(y1)
+            if cx0 > cx1:
+                cx0, cx1 = cx1, cx0
+            if cy0 > cy1:
+                cy0, cy1 = cy1, cy0
+            self.canvas.create_rectangle(
+                cx0,
+                cy0,
+                cx1,
+                cy1,
+                fill="#1e1e1e",
+                stipple="gray25",
+                outline="#8a8a8a",
+                width=1,
+                tags="ignored",
+            )
+
+    def _prune_ignored_cells(self) -> None:
+        if not self.ignored_cells or self.pil_image is None:
+            return
+        rects = list_tile_rects(
+            self.pil_image,
+            self.v_lines,
+            self.h_lines,
+            self.montage_table and self._montage_gutter_shape_ok(),
+            self.montage_nrows,
+            self.montage_ncols,
+        )
+        valid = {(r, c) for _b, r, c in rects}
+        self.ignored_cells &= valid
+
+    def _clear_ignored(self) -> None:
+        if not self.ignored_cells:
+            return
+        self.ignored_cells.clear()
+        if self.pil_image is not None:
+            self._rebuild_display()
+        self.status.config(text="Cleared ignored tile marks.")
+
     def _pick_line(self, cx: float, cy: float) -> Optional[Tuple[str, int, int]]:
         """
         Return (kind, index, pixel) for the nearest grabbable line, or None.
@@ -901,6 +1006,9 @@ class ImageSplitApp:
         m = self.mode.get()
         if m == "circle":
             self.canvas.config(cursor="cross")
+            return
+        if m == "ignore":
+            self.canvas.config(cursor="target")
             return
         p = self._pick_line(cx, cy)
         if p and m in ("move", "delete"):
@@ -983,6 +1091,32 @@ class ImageSplitApp:
                     compress_level=cl,
                     optimize=True,
                 )
+            return
+
+        if mode == "ignore":
+            g = get_tile_at_pixel(
+                self.pil_image,
+                self.v_lines,
+                self.h_lines,
+                ix,
+                iy,
+                self.montage_table and self._montage_gutter_shape_ok(),
+                self.montage_nrows,
+                self.montage_ncols,
+            )
+            if g is None:
+                messagebox.showinfo(
+                    "Ignore tile",
+                    "Click inside a region bounded by your cut lines (or the whole image if there are no lines).",
+                )
+                return
+            _tile, r, c = g
+            key = (r, c)
+            if key in self.ignored_cells:
+                self.ignored_cells.discard(key)
+            else:
+                self.ignored_cells.add(key)
+            self._rebuild_display()
             return
 
         p = self._pick_line(cx, cy)
@@ -1081,6 +1215,7 @@ class ImageSplitApp:
 
     def _clear_lines(self) -> None:
         self.montage_table = False
+        self.ignored_cells.clear()
         self.v_lines = []
         self.h_lines = []
         if self.pil_image is not None:
@@ -1094,14 +1229,16 @@ class ImageSplitApp:
         z_pct = int(round(100.0 * self._zoom))
         if self.montage_table and self._montage_gutter_shape_ok():
             ncells = self.montage_nrows * self.montage_ncols
+            ign = f"  |  {len(self.ignored_cells)} ignored" if self.ignored_cells else ""
             self.status.config(
                 text=f"Image: {self.pil_image.size[0]}×{self.pil_image.size[1]}  |  {z_pct}% of fit  |  "
-                f"Table {self.montage_nrows}×{self.montage_ncols} (white gap export)  |  {ncells} content cells"
+                f"Table {self.montage_nrows}×{self.montage_ncols} (white gap export)  |  {ncells} content cells{ign}"
             )
             return
         cells = (nv + 1) * (nh + 1)
+        ign = f"  |  {len(self.ignored_cells)} ignored" if self.ignored_cells else ""
         self.status.config(
-            text=f"Image: {self.pil_image.size[0]}×{self.pil_image.size[1]}  |  {z_pct}% of fit  |  {nv} vertical, {nh} horizontal  →  {cells} tile(s)"
+            text=f"Image: {self.pil_image.size[0]}×{self.pil_image.size[1]}  |  {z_pct}% of fit  |  {nv} vertical, {nh} horizontal  →  {cells} tile(s){ign}"
         )
 
     def _open(self) -> None:
@@ -1131,6 +1268,7 @@ class ImageSplitApp:
         self._nudge_pending = None
         self._recenter = True
         self.montage_table = False
+        self.ignored_cells.clear()
         self._rebuild_display()
 
     def _export_file_format(self) -> str:
@@ -1214,12 +1352,15 @@ class ImageSplitApp:
         d = filedialog.askdirectory(title="Export folder")
         if not d:
             return
+        self._prune_ignored_cells()
+        n_skip = len(self.ignored_cells)
         name = os.path.basename(self._path or "image.png")
         fmt = self._export_file_format()
         tc = self._export_transparent_circles.get()
         eff = _effective_format_for_saving(fmt, tc)
         ext = _export_ext_for_format(eff)
         save_opts = self._get_save_options()
+        ign = frozenset(self.ignored_cells)
         try:
             if self.montage_table and self._montage_gutter_shape_ok():
                 n = export_tiles_montage(
@@ -1233,6 +1374,7 @@ class ImageSplitApp:
                     file_format=fmt,
                     transparent_circle_cutout=tc,
                     save_options=save_opts,
+                    ignored=ign,
                 )
             else:
                 n = export_tiles(
@@ -1244,6 +1386,7 @@ class ImageSplitApp:
                     file_format=fmt,
                     transparent_circle_cutout=tc,
                     save_options=save_opts,
+                    ignored=ign,
                 )
         except OSError as err:
             messagebox.showerror("Export failed", str(err))
@@ -1251,6 +1394,8 @@ class ImageSplitApp:
         note = ""
         if tc and (fmt or "").lower() in ("jpg", "jpeg", "jpe"):
             note = "\n\n(Transparent cutouts are saved as PNG; JPEG has no alpha channel.)"
+        if n_skip:
+            note += f"\n\n({n_skip} tile(s) marked ignored were not exported; click them again in Ignore mode to unmark.)"
         messagebox.showinfo("Export", f"Wrote {n} .{ext} file(s) to:\n{d}{note}")
 
     def run(self) -> None:
