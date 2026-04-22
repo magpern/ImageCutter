@@ -41,6 +41,10 @@ python app.py
 
 If you use **VS Code**, you can start debugging from `.vscode/launch.json`.
 
+## Standalone binaries (CI)
+
+The workflow **Build binaries** (`.github/workflows/build-binaries.yml`) runs on **workflow_dispatch** (Actions tab → run workflow) and on **pushes to tags** matching `v*`. It builds a **PyInstaller** one-file app on **Windows**, **macOS**, and **Ubuntu**, and uploads three **artifacts** (one per OS). Download the artifact for your platform, extract if needed, and run the executable. macOS builds are **not** notarized; you may need to allow the app in Security settings the first time.
+
 ## What you can do
 
 - **Open** an image, **add vertical / horizontal lines** (or **move** / **delete** them).
