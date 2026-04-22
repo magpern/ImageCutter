@@ -1,0 +1,526 @@
+"""
+Image Split — place vertical and horizontal crop lines, then export tiles.
+Requires: pip install -r requirements.txt
+Run: python app.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from typing import List, Optional, Tuple
+
+from PIL import Image, ImageTk
+
+
+def compute_tiles(
+    image: Image.Image, vertical: List[int], horizontal: List[int]
+) -> List[Tuple[Image.Image, int, int]]:
+    """Return cropped regions; vertical = x positions, horizontal = y positions (sorted, inside image)."""
+    w, h = image.size
+    xs = sorted([0] + [x for x in vertical if 0 < x < w] + [w])
+    ys = sorted([0] + [y for y in horizontal if 0 < y < h] + [h])
+    tiles: List[Tuple[Image.Image, int, int]] = []
+    for r, (y0, y1) in enumerate(zip(ys, ys[1:])):
+        for c, (x0, x1) in enumerate(zip(xs, xs[1:])):
+            if x1 <= x0 or y1 <= y0:
+                continue
+            box = (x0, y0, x1, y1)
+            tiles.append((image.crop(box), r, c))
+    return tiles
+
+
+def export_tiles(
+    image: Image.Image, vertical: List[int], horizontal: List[int], out_dir: str, basename: str
+) -> int:
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(basename or "image")[0]
+    count = 0
+    for tile, r, c in compute_tiles(image, vertical, horizontal):
+        name = f"{stem}_r{r}_c{c}.png"
+        path = os.path.join(out_dir, name)
+        tile.save(path, format="PNG")
+        count += 1
+    return count
+
+
+class ImageSplitApp:
+    PICK_PX = 8  # max distance in screen pixels to select a line
+    # Zoom: scale = _fit * _zoom, where _fit = min(avail/iw, avail/ih) to first fit the window
+    ZOOM_MIN = 0.25
+    ZOOM_MAX = 8.0
+    WHEEL_ZOOM = 1.1
+    # Avoid allocating enormous PhotoImage / resize (side length cap)
+    MAX_VIEW_PX = 12_000
+
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("Image Split")
+        self.root.minsize(800, 600)
+        # State
+        self.pil_image: Optional[Image.Image] = None
+        self._photo: Optional[ImageTk.PhotoImage] = None
+        self._fit: float = 1.0  # "fit in window" scale (depends on image + window size)
+        self._zoom: float = 1.0  # user multiplier; 1.0 = fit, >1 = zoomed in on fit
+        self.scale: float = 1.0  # = _fit * _zoom, possibly capped (pixels per source pixel)
+        # top-left of displayed image in canvas coordinates (pan)
+        self._img_x0: float = 0.0
+        self._img_y0: float = 0.0
+        self.v_lines: List[int] = []
+        self.h_lines: List[int] = []
+        self.mode = tk.StringVar(value="v")  # v, h, move, delete
+        # (kind, current x or y in image space) — which line is being moved
+        self._drag: Optional[Tuple[str, int]] = None
+        self._path: Optional[str] = None
+        self._recenter: bool = False
+        # after zoom, apply pan so (u,v) in image lines up with (cx, cy) in canvas
+        self._nudge_pending: Optional[Tuple[float, float, float, float]] = None  # (cx, cy, u, v)
+        # UI
+        self._build_ui()
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.root.bind("<Escape>", lambda _e: self._end_drag())
+        # Dark-ish theme for lines visibility on photos
+        self.root.configure(bg="#1e1e1e")
+        # Global mouse move for line hover when over canvas
+        self.canvas.bind("<Motion>", self._on_canvas_motion)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+    def _build_ui(self) -> None:
+        main = ttk.Frame(self.root, padding=6)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        bar = ttk.Frame(main)
+        bar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(bar, text="Open image…", command=self._open).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bar, text="Export tiles…", command=self._export).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Radiobutton(
+            bar, text="Add vertical", variable=self.mode, value="v"
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(
+            bar, text="Add horizontal", variable=self.mode, value="h"
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(
+            bar, text="Move", variable=self.mode, value="move"
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(
+            bar, text="Delete (click line)", variable=self.mode, value="delete"
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(bar, text="Clear lines", command=self._clear_lines).pack(side=tk.LEFT, padx=4)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Label(bar, text="Zoom:").pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Button(bar, text="−", width=3, command=lambda: self._bump_zoom(1.0 / self.WHEEL_ZOOM)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="+", width=3, command=lambda: self._bump_zoom(self.WHEEL_ZOOM)).pack(
+            side=tk.LEFT, padx=1
+        )
+        ttk.Button(bar, text="Fit to window", command=self._fit_view).pack(side=tk.LEFT, padx=6)
+        ttk.Label(bar, text="(Scroll wheel to zoom, scrollbars to pan when zoomed.)", foreground="gray").pack(
+            side=tk.LEFT, padx=12
+        )
+
+        self.status = ttk.Label(main, text="Open an image to start.")
+        self.status.pack(anchor=tk.W, pady=(0, 4))
+
+        # Canvas in a frame for border
+        cframe = ttk.Frame(main)
+        cframe.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(cframe, background="#2d2d2d", highlightthickness=0)
+        self._vscroll = ttk.Scrollbar(cframe, orient=tk.VERTICAL, command=self.canvas.yview)
+        self._hscroll = ttk.Scrollbar(cframe, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.config(xscrollcommand=self._hscroll.set, yscrollcommand=self._vscroll.set)
+        self._hscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self._vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._win_w = 0
+        self._win_h = 0
+        self._ox = 0.0
+        self._oy = 0.0
+        self._bind_zoom_wheel()
+
+    def _on_configure(self, _evt: Optional[tk.Event] = None) -> None:
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w < 2 or h < 2:
+            return
+        self._win_w, self._win_h = w, h
+        if self.pil_image is not None:
+            self._rebuild_display()
+        else:
+            self._draw_idle()
+
+    def _draw_idle(self) -> None:
+        self.canvas.delete("all")
+        self.canvas.create_text(
+            self._win_w // 2,
+            self._win_h // 2,
+            text="File → Open image, then add vertical/horizontal lines.\nDrag in Move mode to adjust.\nScroll the mouse wheel to zoom, or use the zoom buttons.",
+            fill="#888",
+            font=("Segoe UI", 12),
+            justify=tk.CENTER,
+        )
+
+    def _apply_scale_and_pan(self) -> Tuple[float, float, int, int]:
+        """Set self._fit, self._zoom, self.scale from self._win and image. Returns (d_wf, d_hf, dw, dh) display sizes."""
+        if self.pil_image is None:
+            return 0, 0, 0, 0
+        iw, ih = self.pil_image.size
+        margin = 16
+        aw = max(1, self._win_w - 2 * margin)
+        ah = max(1, self._win_h - 2 * margin)
+        self._fit = min(aw / max(iw, 1), ah / max(ih, 1))
+        self._zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, self._zoom))
+        self.scale = self._fit * self._zoom
+        # hard cap: avoid OOM and slow resizes on extreme zoom
+        s_cap = min(self.MAX_VIEW_PX / max(iw, 1), self.MAX_VIEW_PX / max(ih, 1), self.scale)
+        if s_cap < self.scale:
+            self.scale = s_cap
+            if self._fit > 0:
+                self._zoom = self.scale / self._fit
+        dwf = max(1.0, self.scale * iw)
+        dhf = max(1.0, self.scale * ih)
+        dw, dh = int(dwf), int(dhf)
+        if dw < 1:
+            dw = 1
+        if dh < 1:
+            dh = 1
+        return dwf, dhf, dw, dh
+
+    def _rebuild_display(self) -> None:
+        if self.pil_image is None:
+            return
+        dwf, dhf, dw, dh = self._apply_scale_and_pan()
+        wn, hn = self._win_w, self._win_h
+        if self._recenter:
+            self._recenter = False
+            self._img_x0 = (wn - dwf) / 2.0
+            self._img_y0 = (hn - dhf) / 2.0
+        elif self._nudge_pending is not None:
+            cx, cy, u, v = self._nudge_pending
+            self._nudge_pending = None
+            self._img_x0 = cx - u * dwf
+            self._img_y0 = cy - v * dhf
+        self._clamp_pan(dwf, dhf, wn, hn)
+        self._ox, self._oy = self._img_x0, self._img_y0
+        # Resize for display (integer size)
+        small = self.pil_image.resize((dw, dh), Image.Resampling.LANCZOS)
+        self._photo = ImageTk.PhotoImage(small)
+        self.canvas.delete("all")
+        self.canvas.create_image(self._ox, self._oy, anchor=tk.NW, image=self._photo)
+        self._draw_overlays()
+        r_w = max(wn, int(self._ox + dw) + 24, 8)
+        r_h = max(hn, int(self._oy + dh) + 24, 8)
+        self.canvas.config(scrollregion=(0, 0, r_w, r_h))
+        self._update_status()
+
+    def _clamp_pan(self, dwf: float, dhf: float, wn: int, hn: int) -> None:
+        if dwf <= wn + 0.1:
+            self._img_x0 = (wn - dwf) / 2.0
+        else:
+            self._img_x0 = min(0, max(self._img_x0, wn - dwf))
+        if dhf <= hn + 0.1:
+            self._img_y0 = (hn - dhf) / 2.0
+        else:
+            self._img_y0 = min(0, max(self._img_y0, hn - dhf))
+
+    def _do_zoom_around(self, factor: float, ex: int, ey: int) -> None:
+        if self.pil_image is None or self._win_w < 2:
+            return
+        iw, ih = self.pil_image.size
+        dwo = max(1e-6, iw * self.scale)
+        dho = max(1e-6, ih * self.scale)
+        cx, cy = self.canvas.canvasx(ex), self.canvas.canvasy(ey)
+        u = (cx - self._img_x0) / dwo
+        v = (cy - self._img_y0) / dho
+        in_image = (self._img_x0 <= cx <= self._img_x0 + dwo) and (self._img_y0 <= cy <= self._img_y0 + dho)
+        if in_image:
+            u = max(0.0, min(1.0, u))
+            v = max(0.0, min(1.0, v))
+        else:
+            u, v = 0.5, 0.5
+        new_z = max(self.ZOOM_MIN, min(self.ZOOM_MAX, self._zoom * factor))
+        if abs(new_z - self._zoom) < 1e-6:
+            return
+        self._nudge_pending = (cx, cy, u, v)
+        self._zoom = new_z
+        self._rebuild_display()
+
+    def _bump_zoom(self, factor: float) -> None:
+        w = self.canvas.winfo_width() or 1
+        h2 = self.canvas.winfo_height() or 1
+        self._do_zoom_around(factor, w // 2, h2 // 2)
+
+    def _fit_view(self) -> None:
+        if self.pil_image is None:
+            return
+        self._zoom = 1.0
+        self._nudge_pending = None
+        self._recenter = True
+        self._rebuild_display()
+
+    @staticmethod
+    def _parse_wheel(event: tk.Event) -> Optional[float]:
+        n = getattr(event, "num", 0) or 0
+        if n in (4, 5):
+            return ImageSplitApp.WHEEL_ZOOM if n == 4 else 1.0 / ImageSplitApp.WHEEL_ZOOM
+        d = getattr(event, "delta", 0)
+        if d == 0:
+            return None
+        if d > 0:
+            return ImageSplitApp.WHEEL_ZOOM
+        return 1.0 / ImageSplitApp.WHEEL_ZOOM
+
+    def _on_wheel(self, e: tk.Event) -> str | None:
+        if self.pil_image is None:
+            return None
+        t = self.root.winfo_containing(e.x_root, e.y_root)
+        if t is not self.canvas and e.widget is not self.canvas:
+            return None
+        f = self._parse_wheel(e)
+        if f is None:
+            return None
+        # Coordinates must be relative to the canvas (bind_all on Windows has wrong e.x / e.y)
+        ax = e.x_root - self.canvas.winfo_rootx()
+        ay = e.y_root - self.canvas.winfo_rooty()
+        self._do_zoom_around(f, ax, ay)
+        if sys.platform == "win32":
+            return "break"
+        return None
+
+    def _bind_zoom_wheel(self) -> None:
+        if sys.platform == "win32":
+            self.root.bind_all("<MouseWheel>", self._on_wheel, add="")
+        else:
+            self.canvas.bind("<MouseWheel>", self._on_wheel, add="")
+        self.canvas.bind("<Button-4>", self._on_wheel, add="")
+        self.canvas.bind("<Button-5>", self._on_wheel, add="")
+        self.canvas.bind("<Enter>", lambda _e: self.canvas.focus_set(), add="")
+
+    def _ix_to_cx(self, ix: int) -> float:
+        return self._ox + ix * self.scale
+
+    def _iy_to_cy(self, iy: int) -> float:
+        return self._oy + iy * self.scale
+
+    def _cx_to_ix(self, cx: float) -> int:
+        return int(round((float(cx) - self._ox) / self.scale))
+
+    def _cy_to_iy(self, cy: float) -> int:
+        return int(round((float(cy) - self._oy) / self.scale))
+
+    def _draw_overlays(self) -> None:
+        if self.pil_image is None:
+            return
+        w, h = self.pil_image.size
+        color_v = "#00c8ff"
+        color_h = "#ff6b4a"
+        for ix in self.v_lines:
+            x0 = x1 = self._ix_to_cx(ix)
+            y0, y1 = self._oy, self._oy + h * self.scale
+            self.canvas.create_line(x0, y0, x1, y1, width=2, fill=color_v, tags=("line", f"v{ix}"))
+
+        for iy in self.h_lines:
+            y0 = y1 = self._iy_to_cy(iy)
+            x0, x1 = self._ox, self._ox + w * self.scale
+            self.canvas.create_line(x0, y0, x1, y1, width=2, fill=color_h, tags=("line", f"h{iy}"))
+
+    def _pick_line(self, cx: float, cy: float) -> Optional[Tuple[str, int, int]]:
+        """
+        Return (kind, index, pixel) for the nearest grabbable line, or None.
+        Distance is in screen pixels so zoom does not change grab tolerance.
+        """
+        if self.pil_image is None:
+            return None
+        w, h = self.pil_image.size
+        img_x0, img_x1 = self._ox, self._ox + w * self.scale
+        img_y0, img_y1 = self._oy, self._oy + h * self.scale
+        p = self.PICK_PX
+
+        best: Optional[Tuple[str, int, int, float]] = None
+        for i, xv in enumerate(self.v_lines):
+            if not (img_y0 - p <= cy <= img_y1 + p):
+                continue
+            d = abs(cx - self._ix_to_cx(xv))
+            if d > p:
+                continue
+            if best is None or d < best[3]:
+                best = ("v", i, xv, d)
+        for i, yh in enumerate(self.h_lines):
+            if not (img_x0 - p <= cx <= img_x1 + p):
+                continue
+            d = abs(cy - self._iy_to_cy(yh))
+            if d > p:
+                continue
+            if best is None or d < best[3]:
+                best = ("h", i, yh, d)
+        if best is None:
+            return None
+        return (best[0], best[1], best[2])
+
+    def _on_canvas_motion(self, e: tk.Event) -> None:
+        self.canvas.config(cursor="")
+        if self.pil_image is None:
+            return
+        cx = self.canvas.canvasx(e.x)
+        cy = self.canvas.canvasy(e.y)
+        p = self._pick_line(cx, cy)
+        if p and self.mode.get() in ("move", "delete"):
+            self.canvas.config(cursor="fleur" if self.mode.get() == "move" else "X_cursor")
+        elif p:
+            self.canvas.config(cursor="hand2")
+
+    def _add_unique(self, kind: str, value: int) -> None:
+        w, h = self.pil_image.size  # type: ignore[union-attr]
+        if kind == "v":
+            v = max(1, min(w - 1, value))
+            if any(abs(v - x) < 1.0 for x in self.v_lines):
+                return
+            self.v_lines.append(v)
+            self.v_lines.sort()
+        else:
+            v = max(1, min(h - 1, value))
+            if any(abs(v - y) < 1.0 for y in self.h_lines):
+                return
+            self.h_lines.append(v)
+            self.h_lines.sort()
+        self._rebuild_display()
+
+    def _on_press(self, e: tk.Event) -> None:
+        if self.pil_image is None:
+            return
+        cx = self.canvas.canvasx(e.x)
+        cy = self.canvas.canvasy(e.y)
+        w, h = self.pil_image.size
+        ix = self._cx_to_ix(cx)
+        iy = self._cy_to_iy(cy)
+        if not (0 <= ix < w and 0 <= iy < h):
+            return
+
+        mode = self.mode.get()
+        p = self._pick_line(cx, cy)
+
+        if mode == "delete" and p:
+            kind, i, _ = p[0], p[1], p[2]
+            if kind == "v" and 0 <= i < len(self.v_lines):
+                self.v_lines.pop(i)
+            elif kind == "h" and 0 <= i < len(self.h_lines):
+                self.h_lines.pop(i)
+            self._rebuild_display()
+            return
+        if mode == "move" and p:
+            k, _i, val = p
+            self._drag = (k, val)
+            return
+        if mode == "v":
+            self._add_unique("v", ix)
+        elif mode == "h":
+            self._add_unique("h", iy)
+
+    def _on_drag(self, e: tk.Event) -> None:
+        if self._drag is None or self.pil_image is None:
+            return
+        kind, current = self._drag
+        cx = self.canvas.canvasx(e.x)
+        cy = self.canvas.canvasy(e.y)
+        iw, ih = self.pil_image.size
+        if kind == "v":
+            new_v = self._cx_to_ix(cx)
+            new_v = max(1, min(iw - 1, new_v))
+            for j, v in enumerate(self.v_lines):
+                if v == current:
+                    self.v_lines[j] = new_v
+                    self._drag = ("v", new_v)
+                    break
+        else:
+            new_h = self._cy_to_iy(cy)
+            new_h = max(1, min(ih - 1, new_h))
+            for j, yv in enumerate(self.h_lines):
+                if yv == current:
+                    self.h_lines[j] = new_h
+                    self._drag = ("h", new_h)
+                    break
+        self._rebuild_display()
+
+    def _end_drag(self) -> None:
+        if self.pil_image and self._drag is not None:
+            self.v_lines.sort()
+            self.h_lines.sort()
+        self._drag = None
+        if self.pil_image:
+            self._rebuild_display()
+
+    def _on_release(self, _e: tk.Event) -> None:
+        self._end_drag()
+
+    def _clear_lines(self) -> None:
+        self.v_lines = []
+        self.h_lines = []
+        if self.pil_image is not None:
+            self._rebuild_display()
+        self.status.config(text="Lines cleared.")
+
+    def _update_status(self) -> None:
+        if self.pil_image is None:
+            return
+        nv, nh = len(self.v_lines), len(self.h_lines)
+        cells = (nv + 1) * (nh + 1)
+        z_pct = int(round(100.0 * self._zoom))
+        self.status.config(
+            text=f"Image: {self.pil_image.size[0]}×{self.pil_image.size[1]}  |  {z_pct}% of fit  |  {nv} vertical, {nh} horizontal  →  {cells} tile(s)"
+        )
+
+    def _open(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open image",
+            filetypes=[
+                ("Images", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff"),
+                ("All", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            im = Image.open(path)
+            if im.mode == "P" and "transparency" in im.info:
+                im = im.convert("RGBA")
+            elif im.mode not in ("RGB", "RGBA", "L", "LA", "1"):
+                im = im.convert("RGB")
+        except OSError as err:
+            messagebox.showerror("Open failed", str(err))
+            return
+        self.pil_image = im
+        self._path = path
+        self.v_lines = []
+        self.h_lines = []
+        self._zoom = 1.0
+        self._nudge_pending = None
+        self._recenter = True
+        self._rebuild_display()
+
+    def _export(self) -> None:
+        if self.pil_image is None:
+            messagebox.showinfo("Export", "Open an image first.")
+            return
+        d = filedialog.askdirectory(title="Export folder")
+        if not d:
+            return
+        name = os.path.basename(self._path or "image.png")
+        try:
+            n = export_tiles(self.pil_image, self.v_lines, self.h_lines, d, name)
+        except OSError as err:
+            messagebox.showerror("Export failed", str(err))
+            return
+        messagebox.showinfo("Export", f"Wrote {n} PNG file(s) to:\n{d}")
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    ImageSplitApp().run()
