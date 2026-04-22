@@ -63,3 +63,42 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.out_file }}
           if-no-files-found: error
+
+  # Only on tag pushes: attach all platform builds to the GitHub Release (not workflow_dispatch).
+  release-assets:
+    name: Attach to GitHub Release
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: ImageCutter-*
+
+      - name: Stage files for release
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p upload
+          cp "artifacts/ImageCutter-windows-amd64/ImageCutter.exe" \
+            "upload/ImageCutter-${TAG}-windows-amd64.exe"
+          cp "artifacts/ImageCutter-macos/ImageCutter" \
+            "upload/ImageCutter-${TAG}-macos"
+          cp "artifacts/ImageCutter-linux-amd64/ImageCutter" \
+            "upload/ImageCutter-${TAG}-linux-amd64"
+          chmod +x "upload/ImageCutter-${TAG}-macos" "upload/ImageCutter-${TAG}-linux-amd64"
+          ls -la upload
+
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: upload/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

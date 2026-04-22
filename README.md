@@ -43,7 +43,13 @@ If you use **VS Code**, you can start debugging from `.vscode/launch.json`.
 
 ## Standalone binaries (CI)
 
-The workflow **Build binaries** (`.github/workflows/build-binaries.yml`) runs on **workflow_dispatch** (Actions tab → run workflow) and on **pushes to tags** matching `v*`. It builds a **PyInstaller** one-file app on **Windows**, **macOS**, and **Ubuntu**, and uploads three **artifacts** (one per OS). Download the artifact for your platform, extract if needed, and run the executable. macOS builds are **not** notarized; you may need to allow the app in Security settings the first time.
+The workflow **Build binaries** (`.github/workflows/build-binaries.yml`) runs on **workflow_dispatch** (Actions tab → run workflow) and on **pushes to tags** matching `v*`. It builds a **PyInstaller** one-file app on **Windows**, **macOS**, and **Ubuntu**, and uploads three **workflow artifacts** (one per OS). Download an artifact for your platform, extract if needed, and run the executable. macOS builds are **not** notarized; you may need to allow the app in Security settings the first time.
+
+### Adding binaries to a GitHub Release
+
+**Automatic (recommended):** Create the tag **first** (`git tag v1.0.1 && git push origin v1.0.1`). The workflow builds all platforms, then the **Attach to GitHub Release** job uploads `ImageCutter-<tag>-windows-amd64.exe`, `ImageCutter-<tag>-macos`, and `ImageCutter-<tag>-linux-amd64` to the release for that tag (creating the release if it does not exist yet). If you already published `v1.0.0` from the GitHub UI **before** this job existed, either **re-run** the latest successful **Build binaries** run for that tag (if listed under Actions), or use the manual steps below.
+
+**Manual:** Open the successful workflow run → download each artifact ZIP → unzip → on the release page click **Edit** → drag the files into **Attach binaries** (or use **Add assets**).
 
 ## What you can do
 
