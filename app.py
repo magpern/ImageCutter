@@ -45,37 +45,6 @@ def compute_tiles(
     return tiles
 
 
-def get_tile_at_pixel(
-    im: Image.Image, v: List[int], h: List[int], ix: int, iy: int, montage_3x3: bool
-) -> Optional[Tuple[Image.Image, int, int]]:
-    w, h_ = im.size
-    if not (0 <= ix < w and 0 <= iy < h_):
-        return None
-    if montage_3x3 and len(v) == 4 and len(h) == 4:
-        vx = sorted(v)
-        hy = sorted(h)
-        x0, x1, x2, x3 = vx[0], vx[1], vx[2], vx[3]
-        y0, y1, y2, y3 = hy[0], hy[1], hy[2], hy[3]
-        if not (0 < x0 < x1 < x2 < x3 < w and 0 < y0 < y1 < y2 < y3 < h_):
-            return None
-        xb = [(0, x0), (x1, x2), (x3, w)]
-        yb = [(0, y0), (y1, y2), (y3, h_)]
-    else:
-        if not v and not h:
-            return (im, 0, 0)
-        xs = sorted([0] + [x for x in v if 0 < x < w] + [w])
-        ys = sorted([0] + [y for y in h if 0 < y < h_] + [h_])
-        xb = list(zip(xs, xs[1:]))
-        yb = list(zip(ys, ys[1:]))
-    for r, (ys0, ys1) in enumerate(yb):
-        for c, (xs0, xs1) in enumerate(xb):
-            if xs1 <= xs0 or ys1 <= ys0:
-                continue
-            if xs0 <= ix < xs1 and ys0 <= iy < ys1:
-                return (im.crop((xs0, ys0, xs1, ys1)), r, c)
-    return None
-
-
 @dataclass
 class SaveExportOptions:
     """User-controlled encoding settings for lossy and PNG compression."""
@@ -201,15 +170,132 @@ def _refine_runs_1d(mask: "np.ndarray", min_len: int) -> List[Tuple[int, int]]:
     return [r for r in out if (r[1] - r[0]) >= min_len]
 
 
-def _pick_two_gutter_runs(runs: List[Tuple[int, int]], span: int) -> List[Tuple[int, int]]:
+def _expected_gutter_line_count(n_r_or_c: int) -> int:
+    """Gutter *edge* line positions for a grid with n_r_or_c content rows or columns (≥1)."""
+    return 2 * max(0, n_r_or_c - 1)
+
+
+def _montage_cell_bands(
+    w: int,
+    h: int,
+    nrows: int,
+    ncols: int,
+    vx: List[int],
+    hy: List[int],
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], bool]:
     """
-    Pick the two best gutter runs in a 3x3 contact sheet. Prefer the pair
-    with centers near span/3 and 2*span/3. Runs must be sorted by start.
+    For a table with white gutters: vx/hy are sorted x/y of gutter band edges
+    (two per inter-column/row gap). Produces (xb, yb) content rectangles, row-major.
     """
-    if len(runs) < 1:
+    if ncols < 1 or nrows < 1 or w < 1 or h < 1:
+        return [], [], False
+    ex, ey = _expected_gutter_line_count(ncols), _expected_gutter_line_count(nrows)
+    if len(vx) != ex or len(hy) != ey:
+        return [], [], False
+    xb: List[Tuple[int, int]] = []
+    yb: List[Tuple[int, int]] = []
+    if ncols == 1:
+        xb = [(0, w)]
+    else:
+        if not (0 < vx[0] and vx[-1] < w):
+            return [], [], False
+        for i in range(0, 2 * (ncols - 1) - 1, 2):
+            if not (vx[i] < vx[i + 1]):
+                return [], [], False
+        for j in range(ncols):
+            if j == 0:
+                xb.append((0, vx[0]))
+            elif j < ncols - 1:
+                xb.append((vx[2 * j - 1], vx[2 * j]))
+            else:
+                xb.append((vx[2 * ncols - 3], w))
+    if nrows == 1:
+        yb = [(0, h)]
+    else:
+        if not (0 < hy[0] and hy[-1] < h):
+            return [], [], False
+        for i in range(0, 2 * (nrows - 1) - 1, 2):
+            if not (hy[i] < hy[i + 1]):
+                return [], [], False
+        for r in range(nrows):
+            if r == 0:
+                yb.append((0, hy[0]))
+            elif r < nrows - 1:
+                yb.append((hy[2 * r - 1], hy[2 * r]))
+            else:
+                yb.append((hy[2 * nrows - 3], h))
+    for x0, x1 in xb:
+        if not (0 <= x0 < x1 <= w):
+            return [], [], False
+    for y0, y1 in yb:
+        if not (0 <= y0 < y1 <= h):
+            return [], [], False
+    return xb, yb, True
+
+
+def get_tile_at_pixel(
+    im: Image.Image,
+    v: List[int],
+    h: List[int],
+    ix: int,
+    iy: int,
+    montage_table: bool,
+    nrows: int = 0,
+    ncols: int = 0,
+) -> Optional[Tuple[Image.Image, int, int]]:
+    w, h_ = im.size
+    if not (0 <= ix < w and 0 <= iy < h_):
+        return None
+    exb: List[Tuple[int, int]] = []
+    eyb: List[Tuple[int, int]] = []
+    if (
+        montage_table
+        and nrows >= 1
+        and ncols >= 1
+        and len(v) == _expected_gutter_line_count(ncols)
+        and len(h) == _expected_gutter_line_count(nrows)
+    ):
+        exb, eyb, ok = _montage_cell_bands(
+            w, h_, nrows, ncols, sorted(v), sorted(h)
+        )
+        if not ok or not exb or not eyb:
+            return None
+    if not exb:
+        if not v and not h:
+            return (im, 0, 0)
+        xs = sorted([0] + [x for x in v if 0 < x < w] + [w])
+        ys = sorted([0] + [y for y in h if 0 < y < h_] + [h_])
+        exb = list(zip(xs, xs[1:]))
+        eyb = list(zip(ys, ys[1:]))
+    for r, (ys0, ys1) in enumerate(eyb):
+        for c, (xs0, xs1) in enumerate(exb):
+            if xs1 <= xs0 or ys1 <= ys0:
+                continue
+            if xs0 <= ix < xs1 and ys0 <= iy < ys1:
+                return (im.crop((xs0, ys0, xs1, ys1)), r, c)
+    return None
+
+
+def _scale_gutter_pair(
+    p: Tuple[int, int], span_from: int, span_to: int
+) -> Tuple[int, int]:
+    f = span_to / max(1, span_from)
+    lo, hi = p[0], p[1]
+    a0, a1 = int(round(lo * f)), int(round(hi * f))
+    if a1 - a0 < 1 and hi > lo:
+        a1 = a0 + 1
+    return a0, a1
+
+
+def _pick_k_gutter_runs(
+    runs: List[Tuple[int, int]], span: int, k: int
+) -> List[Tuple[int, int]]:
+    if k <= 0:
+        return []
+    if not runs:
         return []
     sruns = sorted(runs, key=lambda r: r[0])
-    if len(sruns) == 1:
+    if k == 2 and len(sruns) == 1:
         lo, hi = sruns[0]
         if hi - lo < 8:
             return []
@@ -218,53 +304,64 @@ def _pick_two_gutter_runs(runs: List[Tuple[int, int]], span: int) -> List[Tuple[
         if t2 - t < 2:
             return []
         return [(lo, t), (t2, hi)]
-    if len(sruns) == 2:
+    if len(sruns) < k:
+        return []
+    if len(sruns) == k:
         return sruns
-    t1, t2 = span / 3, 2 * span / 3
+    targets = [span * (i + 1) / (k + 1) for i in range(k)]
     centers = [(a + b) * 0.5 for a, b in sruns]
-    j1 = min(range(len(sruns)), key=lambda j: abs(centers[j] - t1))
-    others = [j for j in range(len(sruns)) if j != j1]
-    if not others:
-        return sruns[0:2] if len(sruns) > 1 else sruns[0:1]  # type: ignore[return-value]
-    j2 = min(others, key=lambda j: abs(centers[j] - t2))
-    return [sruns[j1], sruns[j2]]
+    used = [False] * len(sruns)
+    chosen: List[Tuple[int, int]] = []
+    for t in targets:
+        best_j = -1
+        best_d = 1e18
+        for j in range(len(sruns)):
+            if used[j]:
+                continue
+            d = abs(centers[j] - t)
+            if d < best_d:
+                best_d, best_j = d, j
+        if best_j < 0:
+            return []
+        used[best_j] = True
+        chosen.append(sruns[best_j])
+    return sorted(chosen, key=lambda r: r[0])
 
 
-def _scale_runs(
-    g0: Tuple[int, int], g1: Tuple[int, int], s_from: int, s_to: int
-) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-    f = s_to / max(1, s_from)
-
-    def sc(a: int, b: int) -> Tuple[int, int]:
-        x0, x1 = int(round(a * f)), int(round(b * f))
-        if x1 - x0 < 1 and b > a:
-            x1 = x0 + 1
-        return (x0, x1)
-
-    a0, a1 = sc(g0[0], g0[1])
-    a2, a3 = sc(g1[0], g1[1])
-    if a0 > a2:
-        a0, a1, a2, a3 = a2, a3, a0, a1
-    return (a0, a1), (a2, a3)
+def gutter_pairs_to_lines(pairs: List[Tuple[int, int]]) -> List[int]:
+    if not pairs:
+        return []
+    return sorted(c for a, b in pairs for c in (a, b))
 
 
-def detect_montage_gutters_3x3(
-    im: Image.Image, white_thr: int = 235, min_frac: float = 0.94, min_run: int = 1
-) -> Tuple[Optional[Tuple[Tuple[int, int], Tuple[int, int]]], Optional[Tuple[Tuple[int, int], Tuple[int, int]]], str]:
+def detect_montage_gutters(
+    im: Image.Image,
+    nrows: int,
+    ncols: int,
+    white_thr: int = 235,
+    min_frac: float = 0.94,
+    min_run: int = 1,
+) -> Tuple[Optional[List[int]], Optional[List[int]], str]:
     """
-    Find two full-height vertical and two full-width white gutter *bands* (3x3 with gaps).
-    Returns pair of gutter (start, end) half-open ranges in *full image* pixel coords.
+    Find (ncols-1) full-height and (nrows-1) full-width white *gutter* bands (table layout),
+    return the inner edges as vertical and horizontal line lists.
     """
     if np is None:  # pragma: no cover
         return (None, None, "NumPy is required. Run: pip install numpy")
-    w, h = im.size
-    if w < 8 or h < 8:
+    w, h_ = im.size
+    ncg, nrg = max(0, ncols - 1), max(0, nrows - 1)
+    if w < 8 or h_ < 8:
         return (None, None, "Image is too small.")
+    if nrows < 1 or ncols < 1 or nrows > 10 or ncols > 10:
+        return (None, None, "Table size must be 1 to 10 rows and columns.")
+    if ncg == 0 and nrg == 0:
+        return ([], [], "")
+
     nmax = 1800
-    n_w, n_h = w, h
-    if max(w, h) > nmax:
-        s = nmax / max(w, h)
-        n_w, n_h = max(1, int(w * s)), max(1, int(h * s))
+    n_w, n_h = w, h_
+    if max(w, h_) > nmax:
+        s = nmax / max(w, h_)
+        n_w, n_h = max(1, int(w * s)), max(1, int(h_ * s))
         small = im.resize((n_w, n_h), Image.Resampling.BILINEAR).convert("RGB")
     else:
         small = im.convert("RGB")
@@ -278,57 +375,63 @@ def detect_montage_gutters_3x3(
     mrg, mrh = max(1, int(0.08 * w2)), max(1, int(0.08 * h2))
     v_cand = [r for r in v_runs if mrg <= 0.5 * (r[0] + r[1] - 1) <= w2 - 1 - mrg]
     h_cand = [r for r in h_runs if mrh <= 0.5 * (r[0] + r[1] - 1) <= h2 - 1 - mrh]
-    v_pair = _pick_two_gutter_runs(v_cand, w2)
-    h_pair = _pick_two_gutter_runs(h_cand, h2)
-    if len(v_pair) < 2:
-        return (None, None, "Need two full-height near-white columns (gaps). Try a brighter/flat gap or a cleaner composite.")
-    if len(h_pair) < 2:
-        return (None, None, "Need two full-width near-white rows (gaps).")
-    gvx = _scale_runs(v_pair[0], v_pair[1], w2, w) if w2 != w else (v_pair[0], v_pair[1])
-    ghy = _scale_runs(h_pair[0], h_pair[1], h2, h) if h2 != h else (h_pair[0], h_pair[1])
-    if gvx[0][0] > gvx[1][0]:
-        gvx = (gvx[1], gvx[0])
-    if ghy[0][0] > ghy[1][0]:
-        ghy = (ghy[1], ghy[0])
-    (a0, a1), (a2, a3) = gvx[0], gvx[1]
-    (b0, b1), (b2, b3) = ghy[0], ghy[1]
-    if not (0 < a0 < a1 < a2 < a3 < w and 0 < b0 < b1 < b2 < b3 < h):
-        return (None, None, "Gutter detection gave inconsistent positions. Tweak the white level or use manual lines.")
-    return (gvx, ghy, "")
+    v_pairs: List[Tuple[int, int]] = []
+    h_pairs: List[Tuple[int, int]] = []
+    if ncg > 0:
+        v_sel = _pick_k_gutter_runs(v_cand, w2, ncg)
+        if len(v_sel) < ncg:
+            return (
+                None,
+                None,
+                f"Need {ncg} good vertical white gap(s) (for a {ncols} column table). "
+                "Try a brighter, flat gap or place lines by hand.",
+            )
+        for p in v_sel:
+            v_pairs.append(
+                _scale_gutter_pair(p, w2, w) if w2 != w else p
+            )
+    if nrg > 0:
+        h_sel = _pick_k_gutter_runs(h_cand, h2, nrg)
+        if len(h_sel) < nrg:
+            return (
+                None,
+                None,
+                f"Need {nrg} good horizontal white gap(s) (for a {nrows} row table).",
+            )
+        for p in h_sel:
+            h_pairs.append(
+                _scale_gutter_pair(p, h2, h_) if h2 != h_ else p
+            )
+    v_lines = gutter_pairs_to_lines(v_pairs)
+    h_lines = gutter_pairs_to_lines(h_pairs)
+    _, _, ok2 = _montage_cell_bands(
+        w, h_, nrows, ncols, sorted(v_lines), sorted(h_lines)
+    )
+    if not ok2:
+        return (None, None, "Gutter layout was inconsistent. Try another size or draw lines by hand.")
+    return (v_lines, h_lines, "")
 
 
-def pairs_to_4lines(
-    v_g: Tuple[Tuple[int, int], Tuple[int, int]], h_g: Tuple[Tuple[int, int], Tuple[int, int]]
-) -> Tuple[List[int], List[int]]:
-    a, b = v_g[0], v_g[1]
-    c, d = h_g[0], h_g[1]
-    v_lines = sorted([a[0], a[1], b[0], b[1]])
-    h_lines = sorted([c[0], c[1], d[0], d[1]])
-    return v_lines, h_lines
-
-
-def compute_tiles_3x3_montage(
-    image: Image.Image, v_lines: List[int], h_lines: List[int]
+def compute_tiles_montage(
+    image: Image.Image,
+    v_lines: List[int],
+    h_lines: List[int],
+    nrows: int,
+    ncols: int,
 ) -> List[Tuple[Image.Image, int, int]]:
-    """3x3 *content* cells; v_lines and h_lines are four x / four y boundaries each (gaps between)."""
-    w, h = image.size
-    if len(v_lines) != 4 or len(h_lines) != 4:
+    w, h_ = image.size
+    xb, yb, ok = _montage_cell_bands(
+        w, h_, nrows, ncols, sorted(v_lines), sorted(h_lines)
+    )
+    if not ok:
         return []
-    vx = sorted(v_lines)
-    hy = sorted(h_lines)
-    x0, x1, x2, x3 = vx[0], vx[1], vx[2], vx[3]
-    y0, y1, y2, y3 = hy[0], hy[1], hy[2], hy[3]
-    if not (0 < x0 < x1 < x2 < x3 < w and 0 < y0 < y1 < y2 < y3 < h):
-        return []
-    xb = [(0, x0), (x1, x2), (x3, w)]
-    yb = [(0, y0), (y1, y2), (y3, h)]
-    tiles: List[Tuple[Image.Image, int, int]] = []
+    out: List[Tuple[Image.Image, int, int]] = []
     for r, (ys0, ys1) in enumerate(yb):
         for c, (xs0, xs1) in enumerate(xb):
             if xs1 <= xs0 or ys1 <= ys0:
                 continue
-            tiles.append((image.crop((xs0, ys0, xs1, ys1)), r, c))
-    return tiles
+            out.append((image.crop((xs0, ys0, xs1, ys1)), r, c))
+    return out
 
 
 def export_tiles_montage(
@@ -337,6 +440,8 @@ def export_tiles_montage(
     horizontal: List[int],
     out_dir: str,
     basename: str,
+    nrows: int,
+    ncols: int,
     file_format: str = "png",
     transparent_circle_cutout: bool = False,
     save_options: Optional[SaveExportOptions] = None,
@@ -346,7 +451,7 @@ def export_tiles_montage(
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(basename or "image")[0]
     n = 0
-    for tile, r, c in compute_tiles_3x3_montage(image, vertical, horizontal):
+    for tile, r, c in compute_tiles_montage(image, vertical, horizontal, nrows, ncols):
         out = tile
         if transparent_circle_cutout and CIRCLE_EXTRACT_OK:
             t2 = extract_circle_rgba(tile)
@@ -360,6 +465,8 @@ def export_tiles_montage(
 
 class ImageSplitApp:
     PICK_PX = 8  # max distance in screen pixels to select a line
+    # Excel-style "Insert Table" / contact sheet, max 10 in either dimension
+    TABLE_DIM_MAX = 10
     # Zoom: scale = _fit * _zoom, where _fit = min(avail/iw, avail/ih) to first fit the window
     ZOOM_MIN = 0.25
     ZOOM_MAX = 8.0
@@ -389,8 +496,10 @@ class ImageSplitApp:
         self._recenter: bool = False
         # after zoom, apply pan so (u,v) in image lines up with (cx, cy) in canvas
         self._nudge_pending: Optional[Tuple[float, float, float, float]] = None  # (cx, cy, u, v)
-        # True: v/h lines are 4+4 gutter edges; export uses 9 content cells (no white gaps)
-        self.montage_3x3: bool = False
+        # v/h = gutter *edges*; export is nrows×ncols content cells (gaps not exported)
+        self.montage_table: bool = False
+        self.montage_nrows: int = 3
+        self.montage_ncols: int = 3
         # UI
         self._build_ui()
         self.canvas.bind("<Configure>", self._on_configure)
@@ -419,7 +528,9 @@ class ImageSplitApp:
         view_menu.add_command(label="Fit to window", command=self._fit_view)
         tools_menu = tk.Menu(mbar, tearoff=0)
         mbar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Auto: 3×3 from white gaps", command=self._auto_montage_3x3)
+        tools_menu.add_command(
+            label="Auto grid (white gap table)…", command=self._auto_montage_gutters
+        )
         tools_menu.add_command(label="Clear lines", command=self._clear_lines)
         help_menu = tk.Menu(mbar, tearoff=0)
         mbar.add_cascade(label="Help", menu=help_menu)
@@ -443,7 +554,7 @@ class ImageSplitApp:
         messagebox.showinfo(
             "Image Split",
             "Place vertical and horizontal cut lines, then export tiles. "
-            "The Auto: 3x3 from white gaps command finds full-span light gaps. "
+            "The Auto grid (table size in the toolbar) finds full-span light gaps. "
             "Use the View and Tools menus, or the toolbar: export format (PNG, JPEG, WebP) "
             "and quality or PNG compression, remembered separately per format. "
             "Single circle exports use the PNG compression value.",
@@ -496,8 +607,23 @@ class ImageSplitApp:
         ).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(bar, text="Clear lines", command=self._clear_lines).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bar, text="Auto: 3×3 from white gaps", command=self._auto_montage_3x3).pack(
-            side=tk.LEFT, padx=(0, 8)
+        ttk.Label(bar, text="Table:").pack(side=tk.LEFT, padx=(4, 0))
+        tr = tuple(str(i) for i in range(1, self.TABLE_DIM_MAX + 1))
+        self._table_rows = tk.StringVar(value="3")
+        ttk.Label(bar, text="Rows", foreground="gray").pack(side=tk.LEFT, padx=(4, 2))
+        self._table_row_combo = ttk.Combobox(
+            bar, textvariable=self._table_rows, state="readonly", width=3, values=tr
+        )
+        self._table_row_combo.pack(side=tk.LEFT, padx=0)
+        ttk.Label(bar, text="×", foreground="gray").pack(side=tk.LEFT, padx=2)
+        self._table_cols = tk.StringVar(value="3")
+        ttk.Label(bar, text="Cols", foreground="gray").pack(side=tk.LEFT, padx=0)
+        self._table_col_combo = ttk.Combobox(
+            bar, textvariable=self._table_cols, state="readonly", width=3, values=tr
+        )
+        self._table_col_combo.pack(side=tk.LEFT, padx=0)
+        ttk.Button(bar, text="Auto grid (gaps)…", command=self._auto_montage_gutters).pack(
+            side=tk.LEFT, padx=(8, 0)
         )
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Label(bar, text="Zoom:").pack(side=tk.LEFT, padx=(4, 2))
@@ -783,7 +909,7 @@ class ImageSplitApp:
             self.canvas.config(cursor="hand2")
 
     def _add_unique(self, kind: str, value: int) -> None:
-        self.montage_3x3 = False
+        self.montage_table = False
         w, h = self.pil_image.size  # type: ignore[union-attr]
         if kind == "v":
             v = max(1, min(w - 1, value))
@@ -819,7 +945,14 @@ class ImageSplitApp:
                 )
                 return
             g = get_tile_at_pixel(
-                self.pil_image, self.v_lines, self.h_lines, ix, iy, self.montage_3x3
+                self.pil_image,
+                self.v_lines,
+                self.h_lines,
+                ix,
+                iy,
+                self.montage_table and self._montage_gutter_shape_ok(),
+                self.montage_nrows,
+                self.montage_ncols,
             )
             if g is None:
                 messagebox.showinfo(
@@ -860,8 +993,7 @@ class ImageSplitApp:
                 self.v_lines.pop(i)
             elif kind == "h" and 0 <= i < len(self.h_lines):
                 self.h_lines.pop(i)
-            if len(self.v_lines) != 4 or len(self.h_lines) != 4:
-                self.montage_3x3 = False
+            self._check_montage_still_valid()
             self._rebuild_display()
             return
         if mode == "move" and p:
@@ -909,20 +1041,46 @@ class ImageSplitApp:
     def _on_release(self, _e: tk.Event) -> None:
         self._end_drag()
 
-    def _auto_montage_3x3(self) -> None:
+    def _table_dims(self) -> Tuple[int, int]:
+        try:
+            r = int(self._table_rows.get().strip())  # type: ignore[union-attr]
+            c = int(self._table_cols.get().strip())  # type: ignore[union-attr]
+        except (TypeError, ValueError, AttributeError, tk.TclError):
+            r, c = 3, 3
+        r = max(1, min(self.TABLE_DIM_MAX, r))
+        c = max(1, min(self.TABLE_DIM_MAX, c))
+        return r, c
+
+    def _montage_gutter_shape_ok(self) -> bool:
+        if not self.montage_table or self.pil_image is None:
+            return False
+        return (
+            len(self.v_lines) == _expected_gutter_line_count(self.montage_ncols)
+            and len(self.h_lines) == _expected_gutter_line_count(self.montage_nrows)
+        )
+
+    def _check_montage_still_valid(self) -> None:
+        if not self.montage_table:
+            return
+        if not self._montage_gutter_shape_ok():
+            self.montage_table = False
+
+    def _auto_montage_gutters(self) -> None:
         if self.pil_image is None:
             messagebox.showinfo("Auto grid", "Open an image first.")
             return
-        gvx, ghy, err = detect_montage_gutters_3x3(self.pil_image)
+        nrows, ncols = self._table_dims()
+        gvx, ghy, err = detect_montage_gutters(self.pil_image, nrows, ncols)
         if gvx is None or ghy is None or err:
             messagebox.showwarning("Auto grid", err or "Detection failed.")
             return
-        self.v_lines, self.h_lines = pairs_to_4lines(gvx, ghy)
-        self.montage_3x3 = True
+        self.v_lines, self.h_lines = gvx, ghy
+        self.montage_nrows, self.montage_ncols = nrows, ncols
+        self.montage_table = True
         self._rebuild_display()
 
     def _clear_lines(self) -> None:
-        self.montage_3x3 = False
+        self.montage_table = False
         self.v_lines = []
         self.h_lines = []
         if self.pil_image is not None:
@@ -934,10 +1092,11 @@ class ImageSplitApp:
             return
         nv, nh = len(self.v_lines), len(self.h_lines)
         z_pct = int(round(100.0 * self._zoom))
-        if self.montage_3x3 and nv == 4 and nh == 4:
+        if self.montage_table and self._montage_gutter_shape_ok():
+            ncells = self.montage_nrows * self.montage_ncols
             self.status.config(
                 text=f"Image: {self.pil_image.size[0]}×{self.pil_image.size[1]}  |  {z_pct}% of fit  |  "
-                f"3×3 (white gaps cut out on export)  |  9 content tiles"
+                f"Table {self.montage_nrows}×{self.montage_ncols} (white gap export)  |  {ncells} content cells"
             )
             return
         cells = (nv + 1) * (nh + 1)
@@ -971,7 +1130,7 @@ class ImageSplitApp:
         self._zoom = 1.0
         self._nudge_pending = None
         self._recenter = True
-        self.montage_3x3 = False
+        self.montage_table = False
         self._rebuild_display()
 
     def _export_file_format(self) -> str:
@@ -1062,13 +1221,15 @@ class ImageSplitApp:
         ext = _export_ext_for_format(eff)
         save_opts = self._get_save_options()
         try:
-            if self.montage_3x3 and len(self.v_lines) == 4 and len(self.h_lines) == 4:
+            if self.montage_table and self._montage_gutter_shape_ok():
                 n = export_tiles_montage(
                     self.pil_image,
                     self.v_lines,
                     self.h_lines,
                     d,
                     name,
+                    self.montage_nrows,
+                    self.montage_ncols,
                     file_format=fmt,
                     transparent_circle_cutout=tc,
                     save_options=save_opts,
