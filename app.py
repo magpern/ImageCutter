@@ -13,6 +13,11 @@ from typing import List, Optional, Tuple
 
 from PIL import Image, ImageTk
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore
+
 
 def compute_tiles(
     image: Image.Image, vertical: List[int], horizontal: List[int]
@@ -31,18 +36,237 @@ def compute_tiles(
     return tiles
 
 
+# Export: "png" | "jpeg" | "webp" (lowercase)
+def _tile_for_jpeg(im: Image.Image) -> Image.Image:
+    if im.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[-1])
+        return bg
+    if im.mode == "P" and "transparency" in im.info:
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[-1])
+        return bg
+    if im.mode in ("RGB", "L", "1"):
+        return im.convert("RGB")
+    return im.convert("RGB")
+
+
+def save_tile_to_path(path: str, tile: Image.Image, file_format: str) -> None:
+    """file_format: png | jpeg | webp"""
+    f = (file_format or "png").lower()
+    if f in ("jpg", "jpeg", "jpe"):
+        _tile_for_jpeg(tile).save(path, format="JPEG", quality=92, optimize=True, subsampling=0)
+    elif f == "webp":
+        tile.save(path, format="WEBP", quality=90, method=6)
+    else:
+        t = tile
+        if t.mode == "P" and "transparency" in t.info:
+            t = t.convert("RGBA")
+        t.save(path, format="PNG", optimize=True)
+
+
+def _export_ext_for_format(file_format: str) -> str:
+    f = (file_format or "png").lower()
+    if f in ("jpg", "jpeg", "jpe"):
+        return "jpg"
+    if f == "webp":
+        return "webp"
+    return "png"
+
+
 def export_tiles(
-    image: Image.Image, vertical: List[int], horizontal: List[int], out_dir: str, basename: str
+    image: Image.Image,
+    vertical: List[int],
+    horizontal: List[int],
+    out_dir: str,
+    basename: str,
+    file_format: str = "png",
 ) -> int:
+    ext = _export_ext_for_format(file_format)
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(basename or "image")[0]
     count = 0
     for tile, r, c in compute_tiles(image, vertical, horizontal):
-        name = f"{stem}_r{r}_c{c}.png"
+        name = f"{stem}_r{r}_c{c}.{ext}"
         path = os.path.join(out_dir, name)
-        tile.save(path, format="PNG")
+        save_tile_to_path(path, tile, file_format)
         count += 1
     return count
+
+
+def _refine_runs_1d(mask: "np.ndarray", min_len: int) -> List[Tuple[int, int]]:
+    """Consecutive True regions; merge if separated by 1–2 Falses; require len >= min_len."""
+    if np is None:  # pragma: no cover
+        return []
+    a = np.asarray(mask, dtype=bool)
+    n = int(a.size)
+    i = 0
+    out: List[Tuple[int, int]] = []
+    while i < n:
+        if not a[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and a[j]:
+            j += 1
+        if j - i >= 1:
+            if out and i - out[-1][1] <= 2:
+                lo, _ = out.pop()
+                out.append((lo, j))
+            else:
+                out.append((i, j))
+        i = j
+    return [r for r in out if (r[1] - r[0]) >= min_len]
+
+
+def _pick_two_gutter_runs(runs: List[Tuple[int, int]], span: int) -> List[Tuple[int, int]]:
+    """
+    Pick the two best gutter runs in a 3x3 contact sheet. Prefer the pair
+    with centers near span/3 and 2*span/3. Runs must be sorted by start.
+    """
+    if len(runs) < 1:
+        return []
+    sruns = sorted(runs, key=lambda r: r[0])
+    if len(sruns) == 1:
+        lo, hi = sruns[0]
+        if hi - lo < 8:
+            return []
+        t = (lo * 2 + hi) // 3
+        t2 = (lo + 2 * hi) // 3
+        if t2 - t < 2:
+            return []
+        return [(lo, t), (t2, hi)]
+    if len(sruns) == 2:
+        return sruns
+    t1, t2 = span / 3, 2 * span / 3
+    centers = [(a + b) * 0.5 for a, b in sruns]
+    j1 = min(range(len(sruns)), key=lambda j: abs(centers[j] - t1))
+    others = [j for j in range(len(sruns)) if j != j1]
+    if not others:
+        return sruns[0:2] if len(sruns) > 1 else sruns[0:1]  # type: ignore[return-value]
+    j2 = min(others, key=lambda j: abs(centers[j] - t2))
+    return [sruns[j1], sruns[j2]]
+
+
+def _scale_runs(
+    g0: Tuple[int, int], g1: Tuple[int, int], s_from: int, s_to: int
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    f = s_to / max(1, s_from)
+
+    def sc(a: int, b: int) -> Tuple[int, int]:
+        x0, x1 = int(round(a * f)), int(round(b * f))
+        if x1 - x0 < 1 and b > a:
+            x1 = x0 + 1
+        return (x0, x1)
+
+    a0, a1 = sc(g0[0], g0[1])
+    a2, a3 = sc(g1[0], g1[1])
+    if a0 > a2:
+        a0, a1, a2, a3 = a2, a3, a0, a1
+    return (a0, a1), (a2, a3)
+
+
+def detect_montage_gutters_3x3(
+    im: Image.Image, white_thr: int = 235, min_frac: float = 0.94, min_run: int = 1
+) -> Tuple[Optional[Tuple[Tuple[int, int], Tuple[int, int]]], Optional[Tuple[Tuple[int, int], Tuple[int, int]]], str]:
+    """
+    Find two full-height vertical and two full-width white gutter *bands* (3x3 with gaps).
+    Returns pair of gutter (start, end) half-open ranges in *full image* pixel coords.
+    """
+    if np is None:  # pragma: no cover
+        return (None, None, "NumPy is required. Run: pip install numpy")
+    w, h = im.size
+    if w < 8 or h < 8:
+        return (None, None, "Image is too small.")
+    nmax = 1800
+    n_w, n_h = w, h
+    if max(w, h) > nmax:
+        s = nmax / max(w, h)
+        n_w, n_h = max(1, int(w * s)), max(1, int(h * s))
+        small = im.resize((n_w, n_h), Image.Resampling.BILINEAR).convert("RGB")
+    else:
+        small = im.convert("RGB")
+    rgb = np.array(small, dtype=np.uint8)
+    m2 = (rgb[:, :, 0] >= white_thr) & (rgb[:, :, 1] >= white_thr) & (rgb[:, :, 2] >= white_thr)
+    h2, w2 = m2.shape[0], m2.shape[1]
+    v_gut = (m2.sum(axis=0) / h2) >= min_frac
+    h_gut = (m2.sum(axis=1) / w2) >= min_frac
+    v_runs = _refine_runs_1d(v_gut, min_run)
+    h_runs = _refine_runs_1d(h_gut, min_run)
+    mrg, mrh = max(1, int(0.08 * w2)), max(1, int(0.08 * h2))
+    v_cand = [r for r in v_runs if mrg <= 0.5 * (r[0] + r[1] - 1) <= w2 - 1 - mrg]
+    h_cand = [r for r in h_runs if mrh <= 0.5 * (r[0] + r[1] - 1) <= h2 - 1 - mrh]
+    v_pair = _pick_two_gutter_runs(v_cand, w2)
+    h_pair = _pick_two_gutter_runs(h_cand, h2)
+    if len(v_pair) < 2:
+        return (None, None, "Need two full-height near-white columns (gaps). Try a brighter/flat gap or a cleaner composite.")
+    if len(h_pair) < 2:
+        return (None, None, "Need two full-width near-white rows (gaps).")
+    gvx = _scale_runs(v_pair[0], v_pair[1], w2, w) if w2 != w else (v_pair[0], v_pair[1])
+    ghy = _scale_runs(h_pair[0], h_pair[1], h2, h) if h2 != h else (h_pair[0], h_pair[1])
+    if gvx[0][0] > gvx[1][0]:
+        gvx = (gvx[1], gvx[0])
+    if ghy[0][0] > ghy[1][0]:
+        ghy = (ghy[1], ghy[0])
+    (a0, a1), (a2, a3) = gvx[0], gvx[1]
+    (b0, b1), (b2, b3) = ghy[0], ghy[1]
+    if not (0 < a0 < a1 < a2 < a3 < w and 0 < b0 < b1 < b2 < b3 < h):
+        return (None, None, "Gutter detection gave inconsistent positions. Tweak the white level or use manual lines.")
+    return (gvx, ghy, "")
+
+
+def pairs_to_4lines(
+    v_g: Tuple[Tuple[int, int], Tuple[int, int]], h_g: Tuple[Tuple[int, int], Tuple[int, int]]
+) -> Tuple[List[int], List[int]]:
+    a, b = v_g[0], v_g[1]
+    c, d = h_g[0], h_g[1]
+    v_lines = sorted([a[0], a[1], b[0], b[1]])
+    h_lines = sorted([c[0], c[1], d[0], d[1]])
+    return v_lines, h_lines
+
+
+def compute_tiles_3x3_montage(
+    image: Image.Image, v_lines: List[int], h_lines: List[int]
+) -> List[Tuple[Image.Image, int, int]]:
+    """3x3 *content* cells; v_lines and h_lines are four x / four y boundaries each (gaps between)."""
+    w, h = image.size
+    if len(v_lines) != 4 or len(h_lines) != 4:
+        return []
+    vx = sorted(v_lines)
+    hy = sorted(h_lines)
+    x0, x1, x2, x3 = vx[0], vx[1], vx[2], vx[3]
+    y0, y1, y2, y3 = hy[0], hy[1], hy[2], hy[3]
+    if not (0 < x0 < x1 < x2 < x3 < w and 0 < y0 < y1 < y2 < y3 < h):
+        return []
+    xb = [(0, x0), (x1, x2), (x3, w)]
+    yb = [(0, y0), (y1, y2), (y3, h)]
+    tiles: List[Tuple[Image.Image, int, int]] = []
+    for r, (ys0, ys1) in enumerate(yb):
+        for c, (xs0, xs1) in enumerate(xb):
+            if xs1 <= xs0 or ys1 <= ys0:
+                continue
+            tiles.append((image.crop((xs0, ys0, xs1, ys1)), r, c))
+    return tiles
+
+
+def export_tiles_montage(
+    image: Image.Image,
+    vertical: List[int],
+    horizontal: List[int],
+    out_dir: str,
+    basename: str,
+    file_format: str = "png",
+) -> int:
+    ext = _export_ext_for_format(file_format)
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(basename or "image")[0]
+    n = 0
+    for tile, r, c in compute_tiles_3x3_montage(image, vertical, horizontal):
+        p = os.path.join(out_dir, f"{stem}_r{r}_c{c}.{ext}")
+        save_tile_to_path(p, tile, file_format)
+        n += 1
+    return n
 
 
 class ImageSplitApp:
@@ -76,6 +300,8 @@ class ImageSplitApp:
         self._recenter: bool = False
         # after zoom, apply pan so (u,v) in image lines up with (cx, cy) in canvas
         self._nudge_pending: Optional[Tuple[float, float, float, float]] = None  # (cx, cy, u, v)
+        # True: v/h lines are 4+4 gutter edges; export uses 9 content cells (no white gaps)
+        self.montage_3x3: bool = False
         # UI
         self._build_ui()
         self.canvas.bind("<Configure>", self._on_configure)
@@ -88,7 +314,56 @@ class ImageSplitApp:
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
+    def _build_menu(self) -> None:
+        mbar = tk.Menu(self.root, tearoff=0)
+        file_menu = tk.Menu(mbar, tearoff=0)
+        mbar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Open image…", command=self._open, accelerator="Ctrl+O")
+        file_menu.add_command(label="Export tiles…", command=self._export, accelerator="Ctrl+E")
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._quit, accelerator="Ctrl+Q")
+        view_menu = tk.Menu(mbar, tearoff=0)
+        mbar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_command(label="Zoom in", command=lambda: self._bump_zoom(self.WHEEL_ZOOM))
+        view_menu.add_command(label="Zoom out", command=lambda: self._bump_zoom(1.0 / self.WHEEL_ZOOM))
+        view_menu.add_separator()
+        view_menu.add_command(label="Fit to window", command=self._fit_view)
+        tools_menu = tk.Menu(mbar, tearoff=0)
+        mbar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Auto: 3×3 from white gaps", command=self._auto_montage_3x3)
+        tools_menu.add_command(label="Clear lines", command=self._clear_lines)
+        help_menu = tk.Menu(mbar, tearoff=0)
+        mbar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="About Image Split", command=self._about)
+        self.root.config(menu=mbar)
+        self._bind_menu_shortcuts()
+
+    def _bind_menu_shortcuts(self) -> None:
+        def w(fn):
+            def inner(_e: tk.Event) -> str:
+                fn()
+                return "break"
+
+            return inner
+
+        self.root.bind_all("<Control-o>", w(self._open))
+        self.root.bind_all("<Control-e>", w(self._export))
+        self.root.bind_all("<Control-q>", w(self._quit))
+
+    def _about(self) -> None:
+        messagebox.showinfo(
+            "Image Split",
+            "Place vertical and horizontal cut lines, then export tiles. "
+            "The Auto: 3x3 from white gaps command finds full-span light gaps. "
+            "Use the View and Tools menus, or the toolbar, including export format (PNG, JPEG, WebP).",
+        )
+
+    def _quit(self) -> None:
+        self.root.destroy()
+
     def _build_ui(self) -> None:
+        self._export_format = tk.StringVar(value="PNG")
+        self._build_menu()
         main = ttk.Frame(self.root, padding=6)
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -96,6 +371,15 @@ class ImageSplitApp:
         bar.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(bar, text="Open image…", command=self._open).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(bar, text="Export tiles…", command=self._export).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(bar, text="Format:").pack(side=tk.LEFT, padx=(4, 2))
+        self._export_combo = ttk.Combobox(
+            bar,
+            textvariable=self._export_format,
+            state="readonly",
+            width=8,
+            values=("PNG", "JPEG", "WebP"),
+        )
+        self._export_combo.pack(side=tk.LEFT, padx=(0, 4))
 
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Radiobutton(
@@ -112,6 +396,9 @@ class ImageSplitApp:
         ).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(bar, text="Clear lines", command=self._clear_lines).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="Auto: 3×3 from white gaps", command=self._auto_montage_3x3).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Label(bar, text="Zoom:").pack(side=tk.LEFT, padx=(4, 2))
         ttk.Button(bar, text="−", width=3, command=lambda: self._bump_zoom(1.0 / self.WHEEL_ZOOM)).pack(
@@ -160,7 +447,8 @@ class ImageSplitApp:
         self.canvas.create_text(
             self._win_w // 2,
             self._win_h // 2,
-            text="File → Open image, then add vertical/horizontal lines.\nDrag in Move mode to adjust.\nScroll the mouse wheel to zoom, or use the zoom buttons.",
+            text="Open an image (File menu or toolbar), then add or auto-detect cut lines.\n"
+            "Drag in Move mode to adjust. Use the mouse wheel or View menu to zoom.",
             fill="#888",
             font=("Segoe UI", 12),
             justify=tk.CENTER,
@@ -376,6 +664,7 @@ class ImageSplitApp:
             self.canvas.config(cursor="hand2")
 
     def _add_unique(self, kind: str, value: int) -> None:
+        self.montage_3x3 = False
         w, h = self.pil_image.size  # type: ignore[union-attr]
         if kind == "v":
             v = max(1, min(w - 1, value))
@@ -411,6 +700,8 @@ class ImageSplitApp:
                 self.v_lines.pop(i)
             elif kind == "h" and 0 <= i < len(self.h_lines):
                 self.h_lines.pop(i)
+            if len(self.v_lines) != 4 or len(self.h_lines) != 4:
+                self.montage_3x3 = False
             self._rebuild_display()
             return
         if mode == "move" and p:
@@ -458,7 +749,20 @@ class ImageSplitApp:
     def _on_release(self, _e: tk.Event) -> None:
         self._end_drag()
 
+    def _auto_montage_3x3(self) -> None:
+        if self.pil_image is None:
+            messagebox.showinfo("Auto grid", "Open an image first.")
+            return
+        gvx, ghy, err = detect_montage_gutters_3x3(self.pil_image)
+        if gvx is None or ghy is None or err:
+            messagebox.showwarning("Auto grid", err or "Detection failed.")
+            return
+        self.v_lines, self.h_lines = pairs_to_4lines(gvx, ghy)
+        self.montage_3x3 = True
+        self._rebuild_display()
+
     def _clear_lines(self) -> None:
+        self.montage_3x3 = False
         self.v_lines = []
         self.h_lines = []
         if self.pil_image is not None:
@@ -469,8 +773,14 @@ class ImageSplitApp:
         if self.pil_image is None:
             return
         nv, nh = len(self.v_lines), len(self.h_lines)
-        cells = (nv + 1) * (nh + 1)
         z_pct = int(round(100.0 * self._zoom))
+        if self.montage_3x3 and nv == 4 and nh == 4:
+            self.status.config(
+                text=f"Image: {self.pil_image.size[0]}×{self.pil_image.size[1]}  |  {z_pct}% of fit  |  "
+                f"3×3 (white gaps cut out on export)  |  9 content tiles"
+            )
+            return
+        cells = (nv + 1) * (nh + 1)
         self.status.config(
             text=f"Image: {self.pil_image.size[0]}×{self.pil_image.size[1]}  |  {z_pct}% of fit  |  {nv} vertical, {nh} horizontal  →  {cells} tile(s)"
         )
@@ -501,7 +811,17 @@ class ImageSplitApp:
         self._zoom = 1.0
         self._nudge_pending = None
         self._recenter = True
+        self.montage_3x3 = False
         self._rebuild_display()
+
+    def _export_file_format(self) -> str:
+        m = {"PNG": "png", "JPEG": "jpeg", "WEBP": "webp"}
+        k = (self._export_format.get() or "PNG").strip().upper()
+        if k in ("JPG", "JPEG", "JPE"):
+            k = "JPEG"
+        if k in ("WEBP", "WEPB"):
+            k = "WEBP"
+        return m.get(k, "png")
 
     def _export(self) -> None:
         if self.pil_image is None:
@@ -511,12 +831,17 @@ class ImageSplitApp:
         if not d:
             return
         name = os.path.basename(self._path or "image.png")
+        fmt = self._export_file_format()
+        ext = _export_ext_for_format(fmt)
         try:
-            n = export_tiles(self.pil_image, self.v_lines, self.h_lines, d, name)
+            if self.montage_3x3 and len(self.v_lines) == 4 and len(self.h_lines) == 4:
+                n = export_tiles_montage(self.pil_image, self.v_lines, self.h_lines, d, name, file_format=fmt)
+            else:
+                n = export_tiles(self.pil_image, self.v_lines, self.h_lines, d, name, file_format=fmt)
         except OSError as err:
             messagebox.showerror("Export failed", str(err))
             return
-        messagebox.showinfo("Export", f"Wrote {n} PNG file(s) to:\n{d}")
+        messagebox.showinfo("Export", f"Wrote {n} .{ext} file(s) to:\n{d}")
 
     def run(self) -> None:
         self.root.mainloop()
