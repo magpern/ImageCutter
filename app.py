@@ -8,10 +8,19 @@ from __future__ import annotations
 import os
 import sys
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageTk
+
+try:
+    from circle_extract import CIRCLE_EXTRACT_OK, extract_circle_rgba
+except ImportError:  # pragma: no cover
+    CIRCLE_EXTRACT_OK = False  # type: ignore[misc, assignment]
+
+    def extract_circle_rgba(_: Image.Image) -> Optional[Image.Image]:  # type: ignore[no-redef, misc]
+        return None
 
 try:
     import numpy as np
@@ -36,6 +45,47 @@ def compute_tiles(
     return tiles
 
 
+def get_tile_at_pixel(
+    im: Image.Image, v: List[int], h: List[int], ix: int, iy: int, montage_3x3: bool
+) -> Optional[Tuple[Image.Image, int, int]]:
+    w, h_ = im.size
+    if not (0 <= ix < w and 0 <= iy < h_):
+        return None
+    if montage_3x3 and len(v) == 4 and len(h) == 4:
+        vx = sorted(v)
+        hy = sorted(h)
+        x0, x1, x2, x3 = vx[0], vx[1], vx[2], vx[3]
+        y0, y1, y2, y3 = hy[0], hy[1], hy[2], hy[3]
+        if not (0 < x0 < x1 < x2 < x3 < w and 0 < y0 < y1 < y2 < y3 < h_):
+            return None
+        xb = [(0, x0), (x1, x2), (x3, w)]
+        yb = [(0, y0), (y1, y2), (y3, h_)]
+    else:
+        if not v and not h:
+            return (im, 0, 0)
+        xs = sorted([0] + [x for x in v if 0 < x < w] + [w])
+        ys = sorted([0] + [y for y in h if 0 < y < h_] + [h_])
+        xb = list(zip(xs, xs[1:]))
+        yb = list(zip(ys, ys[1:]))
+    for r, (ys0, ys1) in enumerate(yb):
+        for c, (xs0, xs1) in enumerate(xb):
+            if xs1 <= xs0 or ys1 <= ys0:
+                continue
+            if xs0 <= ix < xs1 and ys0 <= iy < ys1:
+                return (im.crop((xs0, ys0, xs1, ys1)), r, c)
+    return None
+
+
+@dataclass
+class SaveExportOptions:
+    """User-controlled encoding settings for lossy and PNG compression."""
+
+    jpeg_quality: int = 92  # 1–100
+    webp_quality: int = 90  # 0–100
+    webp_method: int = 6  # 0=fast / 6=slow-smaller; Pillow WebP
+    png_compress: int = 6  # 0–9
+
+
 # Export: "png" | "jpeg" | "webp" (lowercase)
 def _tile_for_jpeg(im: Image.Image) -> Image.Image:
     if im.mode in ("RGBA", "LA"):
@@ -52,18 +102,30 @@ def _tile_for_jpeg(im: Image.Image) -> Image.Image:
     return im.convert("RGB")
 
 
-def save_tile_to_path(path: str, tile: Image.Image, file_format: str) -> None:
-    """file_format: png | jpeg | webp"""
+def save_tile_to_path(
+    path: str,
+    tile: Image.Image,
+    file_format: str,
+    options: Optional[SaveExportOptions] = None,
+) -> None:
+    """file_format: png | jpeg | webp. Optional encoding options (defaults are reasonable)."""
+    o = options or SaveExportOptions()
     f = (file_format or "png").lower()
     if f in ("jpg", "jpeg", "jpe"):
-        _tile_for_jpeg(tile).save(path, format="JPEG", quality=92, optimize=True, subsampling=0)
+        q = max(1, min(100, int(o.jpeg_quality)))
+        _tile_for_jpeg(tile).save(
+            path, format="JPEG", quality=q, optimize=True, subsampling=0
+        )
     elif f == "webp":
-        tile.save(path, format="WEBP", quality=90, method=6)
+        q = max(0, min(100, int(o.webp_quality)))
+        m = max(0, min(6, int(o.webp_method)))
+        tile.save(path, format="WEBP", quality=q, method=m)
     else:
         t = tile
         if t.mode == "P" and "transparency" in t.info:
             t = t.convert("RGBA")
-        t.save(path, format="PNG", optimize=True)
+        cl = max(0, min(9, int(o.png_compress)))
+        t.save(path, format="PNG", compress_level=cl, optimize=True)
 
 
 def _export_ext_for_format(file_format: str) -> str:
@@ -75,6 +137,18 @@ def _export_ext_for_format(file_format: str) -> str:
     return "png"
 
 
+def _effective_format_for_saving(
+    file_format: str, transparent_circle_cutout: bool
+) -> str:
+    """Alpha-friendly formats; JPEG is upgraded to PNG when a circle is applied."""
+    if not transparent_circle_cutout:
+        return file_format
+    f = (file_format or "png").lower()
+    if f in ("jpg", "jpeg", "jpe"):
+        return "png"
+    return file_format
+
+
 def export_tiles(
     image: Image.Image,
     vertical: List[int],
@@ -82,15 +156,22 @@ def export_tiles(
     out_dir: str,
     basename: str,
     file_format: str = "png",
+    transparent_circle_cutout: bool = False,
+    save_options: Optional[SaveExportOptions] = None,
 ) -> int:
-    ext = _export_ext_for_format(file_format)
+    eff = _effective_format_for_saving(file_format, transparent_circle_cutout)
+    ext = _export_ext_for_format(eff)
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(basename or "image")[0]
     count = 0
     for tile, r, c in compute_tiles(image, vertical, horizontal):
-        name = f"{stem}_r{r}_c{c}.{ext}"
-        path = os.path.join(out_dir, name)
-        save_tile_to_path(path, tile, file_format)
+        out = tile
+        if transparent_circle_cutout and CIRCLE_EXTRACT_OK:
+            t2 = extract_circle_rgba(tile)
+            if t2 is not None:
+                out = t2
+        p = os.path.join(out_dir, f"{stem}_r{r}_c{c}.{ext}")
+        save_tile_to_path(p, out, eff, save_options)
         count += 1
     return count
 
@@ -257,14 +338,22 @@ def export_tiles_montage(
     out_dir: str,
     basename: str,
     file_format: str = "png",
+    transparent_circle_cutout: bool = False,
+    save_options: Optional[SaveExportOptions] = None,
 ) -> int:
-    ext = _export_ext_for_format(file_format)
+    eff = _effective_format_for_saving(file_format, transparent_circle_cutout)
+    ext = _export_ext_for_format(eff)
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(basename or "image")[0]
     n = 0
     for tile, r, c in compute_tiles_3x3_montage(image, vertical, horizontal):
+        out = tile
+        if transparent_circle_cutout and CIRCLE_EXTRACT_OK:
+            t2 = extract_circle_rgba(tile)
+            if t2 is not None:
+                out = t2
         p = os.path.join(out_dir, f"{stem}_r{r}_c{c}.{ext}")
-        save_tile_to_path(p, tile, file_format)
+        save_tile_to_path(p, out, eff, save_options)
         n += 1
     return n
 
@@ -293,7 +382,7 @@ class ImageSplitApp:
         self._img_y0: float = 0.0
         self.v_lines: List[int] = []
         self.h_lines: List[int] = []
-        self.mode = tk.StringVar(value="v")  # v, h, move, delete
+        self.mode = tk.StringVar(value="v")  # v, h, move, delete, circle
         # (kind, current x or y in image space) — which line is being moved
         self._drag: Optional[Tuple[str, int]] = None
         self._path: Optional[str] = None
@@ -355,7 +444,9 @@ class ImageSplitApp:
             "Image Split",
             "Place vertical and horizontal cut lines, then export tiles. "
             "The Auto: 3x3 from white gaps command finds full-span light gaps. "
-            "Use the View and Tools menus, or the toolbar, including export format (PNG, JPEG, WebP).",
+            "Use the View and Tools menus, or the toolbar: export format (PNG, JPEG, WebP) "
+            "and quality or PNG compression, remembered separately per format. "
+            "Single circle exports use the PNG compression value.",
         )
 
     def _quit(self) -> None:
@@ -380,6 +471,12 @@ class ImageSplitApp:
             values=("PNG", "JPEG", "WebP"),
         )
         self._export_combo.pack(side=tk.LEFT, padx=(0, 4))
+        self._export_transparent_circles = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            bar,
+            text="Export: round cutout (transparent)",
+            variable=self._export_transparent_circles,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Radiobutton(
@@ -393,6 +490,9 @@ class ImageSplitApp:
         ).pack(side=tk.LEFT, padx=2)
         ttk.Radiobutton(
             bar, text="Delete (click line)", variable=self.mode, value="delete"
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(
+            bar, text="Extract circle (click cell)", variable=self.mode, value="circle"
         ).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(bar, text="Clear lines", command=self._clear_lines).pack(side=tk.LEFT, padx=4)
@@ -411,6 +511,21 @@ class ImageSplitApp:
         ttk.Label(bar, text="(Scroll wheel to zoom, scrollbars to pan when zoomed.)", foreground="gray").pack(
             side=tk.LEFT, padx=12
         )
+
+        self._quality_mem: Dict[str, int] = {"png": 6, "jpeg": 92, "webp": 90}
+        self._prev_file_fmt: Optional[str] = None
+        self._export_quality = tk.IntVar(value=6)
+        qbar = ttk.Frame(main)
+        qbar.pack(fill=tk.X, pady=(0, 2))
+        self._q_label = ttk.Label(qbar, text="")
+        self._q_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._q_spin = ttk.Spinbox(qbar, textvariable=self._export_quality, width=5)
+        self._q_spin.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            qbar, text="(value remembered for each format)", foreground="gray"
+        ).pack(side=tk.LEFT, padx=(0, 0))
+        self._export_combo.bind("<<ComboboxSelected>>", self._on_export_format_changed)
+        self._on_export_format_changed()
 
         self.status = ttk.Label(main, text="Open an image to start.")
         self.status.pack(anchor=tk.W, pady=(0, 4))
@@ -657,9 +772,13 @@ class ImageSplitApp:
             return
         cx = self.canvas.canvasx(e.x)
         cy = self.canvas.canvasy(e.y)
+        m = self.mode.get()
+        if m == "circle":
+            self.canvas.config(cursor="cross")
+            return
         p = self._pick_line(cx, cy)
-        if p and self.mode.get() in ("move", "delete"):
-            self.canvas.config(cursor="fleur" if self.mode.get() == "move" else "X_cursor")
+        if p and m in ("move", "delete"):
+            self.canvas.config(cursor="fleur" if m == "move" else "X_cursor")
         elif p:
             self.canvas.config(cursor="hand2")
 
@@ -692,6 +811,47 @@ class ImageSplitApp:
             return
 
         mode = self.mode.get()
+        if mode == "circle":
+            if not CIRCLE_EXTRACT_OK:
+                messagebox.showwarning(
+                    "Extract circle",
+                    "OpenCV is not available. Run: pip install opencv-python-headless",
+                )
+                return
+            g = get_tile_at_pixel(
+                self.pil_image, self.v_lines, self.h_lines, ix, iy, self.montage_3x3
+            )
+            if g is None:
+                messagebox.showinfo(
+                    "Extract circle",
+                    "Could not map the click to a cell. Add cut lines so each cell has one disc.",
+                )
+                return
+            tile, r, c = g
+            out = extract_circle_rgba(tile)
+            if out is None:
+                messagebox.showwarning(
+                    "Extract circle",
+                    "No circle was detected in this cell. Check contrast or place lines closer around the disc.",
+                )
+                return
+            path = filedialog.asksaveasfilename(
+                title="Save circle (transparent PNG)",
+                defaultextension=".png",
+                filetypes=[("PNG", "*.png")],
+                initialfile=f"circle_r{r}_c{c}.png",
+            )
+            if path:
+                o = self._get_save_options()
+                cl = o.png_compress
+                out.save(
+                    path,
+                    format="PNG",
+                    compress_level=cl,
+                    optimize=True,
+                )
+            return
+
         p = self._pick_line(cx, cy)
 
         if mode == "delete" and p:
@@ -823,6 +983,71 @@ class ImageSplitApp:
             k = "WEBP"
         return m.get(k, "png")
 
+    @staticmethod
+    def _clamp_int(v: int, lo: int, hi: int) -> int:
+        return max(lo, min(hi, v))
+
+    def _flush_current_quality_to_mem(self) -> None:
+        k = self._export_file_format()
+        try:
+            v = int(self._export_quality.get())
+        except (TypeError, ValueError, tk.TclError):
+            v = self._quality_mem.get(k, 6)
+        if k == "png":
+            self._quality_mem[k] = self._clamp_int(v, 0, 9)
+        elif k == "jpeg":
+            self._quality_mem[k] = self._clamp_int(v, 1, 100)
+        else:
+            self._quality_mem[k] = self._clamp_int(v, 0, 100)
+        self._export_quality.set(self._quality_mem[k])
+
+    def _on_export_format_changed(self, _event: Optional[tk.Event] = None) -> None:
+        if not hasattr(self, "_q_spin") or self._q_spin is None:
+            return
+        new = self._export_file_format()
+        if self._prev_file_fmt is not None and self._prev_file_fmt != new:
+            k_old = self._prev_file_fmt
+            try:
+                v = int(self._export_quality.get())
+            except (TypeError, ValueError, tk.TclError):
+                v = self._quality_mem.get(k_old, 6)
+            if k_old == "png":
+                self._quality_mem[k_old] = self._clamp_int(v, 0, 9)
+            elif k_old == "jpeg":
+                self._quality_mem[k_old] = self._clamp_int(v, 1, 100)
+            else:
+                self._quality_mem[k_old] = self._clamp_int(v, 0, 100)
+        v_new = self._quality_mem.get(new, 6)
+        if new == "png":
+            v_new = self._clamp_int(int(v_new), 0, 9)
+        elif new == "jpeg":
+            v_new = self._clamp_int(int(v_new), 1, 100)
+        else:
+            v_new = self._clamp_int(int(v_new), 0, 100)
+        self._export_quality.set(v_new)
+        self._prev_file_fmt = new
+        if new == "png":
+            self._q_label.config(text="PNG compress (0–9):")
+            self._q_spin.config(from_=0, to=9, increment=1)
+        elif new == "jpeg":
+            self._q_label.config(text="JPEG quality (1–100):")
+            self._q_spin.config(from_=1, to=100, increment=1)
+        else:
+            self._q_label.config(text="WebP quality (0–100):")
+            self._q_spin.config(from_=0, to=100, increment=1)
+
+    def _get_save_options(self) -> SaveExportOptions:
+        self._flush_current_quality_to_mem()
+        j = int(self._quality_mem.get("jpeg", 92))
+        wq = int(self._quality_mem.get("webp", 90))
+        pc = int(self._quality_mem.get("png", 6))
+        return SaveExportOptions(
+            jpeg_quality=self._clamp_int(j, 1, 100),
+            webp_quality=self._clamp_int(wq, 0, 100),
+            png_compress=self._clamp_int(pc, 0, 9),
+            webp_method=6,
+        )
+
     def _export(self) -> None:
         if self.pil_image is None:
             messagebox.showinfo("Export", "Open an image first.")
@@ -832,16 +1057,40 @@ class ImageSplitApp:
             return
         name = os.path.basename(self._path or "image.png")
         fmt = self._export_file_format()
-        ext = _export_ext_for_format(fmt)
+        tc = self._export_transparent_circles.get()
+        eff = _effective_format_for_saving(fmt, tc)
+        ext = _export_ext_for_format(eff)
+        save_opts = self._get_save_options()
         try:
             if self.montage_3x3 and len(self.v_lines) == 4 and len(self.h_lines) == 4:
-                n = export_tiles_montage(self.pil_image, self.v_lines, self.h_lines, d, name, file_format=fmt)
+                n = export_tiles_montage(
+                    self.pil_image,
+                    self.v_lines,
+                    self.h_lines,
+                    d,
+                    name,
+                    file_format=fmt,
+                    transparent_circle_cutout=tc,
+                    save_options=save_opts,
+                )
             else:
-                n = export_tiles(self.pil_image, self.v_lines, self.h_lines, d, name, file_format=fmt)
+                n = export_tiles(
+                    self.pil_image,
+                    self.v_lines,
+                    self.h_lines,
+                    d,
+                    name,
+                    file_format=fmt,
+                    transparent_circle_cutout=tc,
+                    save_options=save_opts,
+                )
         except OSError as err:
             messagebox.showerror("Export failed", str(err))
             return
-        messagebox.showinfo("Export", f"Wrote {n} .{ext} file(s) to:\n{d}")
+        note = ""
+        if tc and (fmt or "").lower() in ("jpg", "jpeg", "jpe"):
+            note = "\n\n(Transparent cutouts are saved as PNG; JPEG has no alpha channel.)"
+        messagebox.showinfo("Export", f"Wrote {n} .{ext} file(s) to:\n{d}{note}")
 
     def run(self) -> None:
         self.root.mainloop()
