@@ -5,11 +5,12 @@ Run: python app.py
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import AbstractSet, Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageTk
@@ -509,6 +510,132 @@ def export_tiles_montage(
     return n
 
 
+def _composite_onto_white_for_analysis(src: Image.Image) -> Image.Image:
+    """
+    RGB composite on white (same as typical JPEG export) so border trim matches
+    what the user sees for transparent or palette images.
+    """
+    if src.mode in ("RGB", "L", "1"):
+        return src.convert("RGB")
+    if src.mode == "LA":
+        l_ = src.getchannel("L")
+        a = src.getchannel("A")
+        base = Image.merge("RGB", (l_, l_, l_))
+        out = Image.new("RGB", src.size, (255, 255, 255))
+        out.paste(base, mask=a)
+        return out
+    if src.mode == "RGBA":
+        r, g, b, a_ = src.split()
+        base = Image.merge("RGB", (r, g, b))
+        out = Image.new("RGB", src.size, (255, 255, 255))
+        out.paste(base, mask=a_)
+        return out
+    if src.mode == "P" and "transparency" in src.info:
+        return _composite_onto_white_for_analysis(src.convert("RGBA"))
+    return src.convert("RGB")
+
+
+def _border_trim_bbox(
+    rgb: "np.ndarray",
+    color_tolerance: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Inclusive bounding box of pixels that are not the estimated border color.
+    (left, top, right, bottom) with right/bottom **inclusive** in pixel indices.
+    """
+    if np is None:  # pragma: no cover
+        return None
+    h_, w_ = int(rgb.shape[0]), int(rgb.shape[1])
+    if w_ < 1 or h_ < 1:
+        return None
+    edge = np.concatenate(
+        [rgb[0, :, :], rgb[-1, :, :], rgb[:, 0, :], rgb[:, -1, :]], axis=0
+    )
+    if edge.size < 1:
+        return None
+    bg = np.median(edge.astype(np.float32), axis=0)
+    tol = max(0, int(color_tolerance))
+    d = np.max(np.abs(rgb.astype(np.float32) - bg), axis=2) > float(tol)
+    if not np.any(d):
+        return None
+    ys, xs = np.where(d)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    return (x0, y0, x1, y1)
+
+
+def _map_trim_box(
+    l: int, t: int, r: int, b: int, w0: int, h0: int, wa: int, ha: int
+) -> Tuple[int, int, int, int]:
+    """
+    Map inclusive bbox (l,t,r,b) on analysis (wa, ha) to a crop box on full
+    (w0, h0). Returns (left, top, right, bottom) for PIL crop (right, bottom exclusive).
+    """
+    l0 = int(math.floor(l * w0 / max(1, wa)))
+    t0 = int(math.floor(t * h0 / max(1, ha)))
+    r0 = int(min(w0, math.ceil((r + 1) * w0 / max(1, wa))))
+    b0 = int(min(h0, math.ceil((b + 1) * h0 / max(1, ha))))
+    if r0 - l0 < 1 or b0 - t0 < 1:
+        return 0, 0, w0, h0
+    return l0, t0, r0, b0
+
+
+def crop_to_content(
+    image: Image.Image,
+    margin: int = 12,
+    color_tolerance: int = 20,
+    max_analysis_dim: int = 2500,
+) -> Tuple[Image.Image, str]:
+    """
+    Trim a wide uniform border (e.g. white) by bounding the non-border pixels
+    and cropping, with a margin. Uses NumPy. Returns (image, err); err is non-empty
+    on failure, otherwise the (possibly) cropped image.
+    """
+    if np is None:  # pragma: no cover
+        return image, "NumPy is required. Run: pip install numpy"
+    w0, h0 = image.size
+    if w0 < 2 or h0 < 2:
+        return image, "Image is too small to crop."
+
+    comp = _composite_onto_white_for_analysis(image)
+    aw, ah = w0, h0
+    arr = np.ascontiguousarray(np.array(comp, dtype=np.uint8))
+    if max(w0, h0) > int(max_analysis_dim) and int(max_analysis_dim) > 32:
+        scale = int(max_analysis_dim) / max(w0, h0)
+        nw = max(1, int(w0 * scale))
+        nh = max(1, int(h0 * scale))
+        small = comp.resize((nw, nh), Image.Resampling.BILINEAR)
+        aw, ah = nw, nh
+        arr = np.ascontiguousarray(np.array(small, dtype=np.uint8))
+    if arr.ndim != 3 or int(arr.shape[2]) < 3:
+        return image, "Could not analyze the image (unexpected layout)."
+
+    bb = _border_trim_bbox(arr, color_tolerance)
+    if bb is None:
+        return (
+            image,
+            "Could not find a clear border (nothing differs enough from the edge color).",
+        )
+
+    x0, y0, x1, y1 = bb
+    l, t, r, b = _map_trim_box(x0, y0, x1, y1, w0, h0, aw, ah)
+    m = max(0, int(margin))
+    l2 = max(0, l - m)
+    t2 = max(0, t - m)
+    r2 = min(w0, r + m)
+    b2 = min(h0, b + m)
+    if r2 - l2 < 2 or b2 - t2 < 2:
+        return image, "Crop would be too small."
+
+    if (l2, t2, r2, b2) == (0, 0, w0, h0):
+        return (
+            image,
+            "Border is already as tight as detected (content fills the image).",
+        )
+
+    return image.crop((l2, t2, r2, b2)), ""
+
+
 class ImageSplitApp:
     PICK_PX = 8  # max distance in screen pixels to select a line
     # Excel-style "Insert Table" / contact sheet, max 10 in either dimension
@@ -578,6 +705,9 @@ class ImageSplitApp:
         tools_menu.add_command(
             label="Auto grid (white gap table)…", command=self._auto_montage_gutters
         )
+        tools_menu.add_command(
+            label="Crop to content (trim border)…", command=self._crop_to_content
+        )
         tools_menu.add_command(label="Clear lines", command=self._clear_lines)
         tools_menu.add_command(label="Clear ignored tiles", command=self._clear_ignored)
         help_menu = tk.Menu(mbar, tearoff=0)
@@ -602,6 +732,7 @@ class ImageSplitApp:
         messagebox.showinfo(
             "Image Split",
             "Place vertical and horizontal cut lines, then export tiles. "
+            "Crop to content (Tools) removes a big uniform border around a logo. "
             "The Auto grid (table size in the toolbar) finds full-span light gaps. "
             "Use the View and Tools menus, or the toolbar: export format (PNG, JPEG, WebP) "
             "and quality or PNG compression, remembered separately per format. "
@@ -677,6 +808,9 @@ class ImageSplitApp:
         ttk.Button(bar, text="Auto grid (gaps)…", command=self._auto_montage_gutters).pack(
             side=tk.LEFT, padx=(8, 0)
         )
+        ttk.Button(
+            bar, text="Crop to content", command=self._crop_to_content
+        ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Label(bar, text="Zoom:").pack(side=tk.LEFT, padx=(4, 2))
         ttk.Button(bar, text="−", width=3, command=lambda: self._bump_zoom(1.0 / self.WHEEL_ZOOM)).pack(
@@ -1212,6 +1346,38 @@ class ImageSplitApp:
         self.montage_nrows, self.montage_ncols = nrows, ncols
         self.montage_table = True
         self._rebuild_display()
+
+    def _crop_to_content(self) -> None:
+        if self.pil_image is None:
+            messagebox.showinfo("Crop to content", "Open an image first.")
+            return
+        m = simpledialog.askinteger(
+            "Crop to content",
+            "Extra margin around the detected content (pixels):",
+            minvalue=0,
+            maxvalue=500,
+            initialvalue=12,
+            parent=self.root,
+        )
+        if m is None:
+            return
+        old_w, old_h = self.pil_image.size
+        new_im, err = crop_to_content(self.pil_image, margin=int(m), color_tolerance=20)
+        if err:
+            messagebox.showwarning("Crop to content", err)
+            return
+        new_w, new_h = new_im.size
+        self.pil_image = new_im
+        self.v_lines = []
+        self.h_lines = []
+        self.montage_table = False
+        self.ignored_cells.clear()
+        self._recenter = True
+        self._nudge_pending = None
+        self._rebuild_display()
+        self.status.config(
+            text=f"Cropped: {old_w}×{old_h} → {new_w}×{new_h}  (border trimmed, margin {int(m)} px)"
+        )
 
     def _clear_lines(self) -> None:
         self.montage_table = False
