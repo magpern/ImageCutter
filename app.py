@@ -636,6 +636,40 @@ def crop_to_content(
     return image.crop((l2, t2, r2, b2)), ""
 
 
+def make_color_transparent(
+    image: Image.Image, key: Tuple[int, int, int], tolerance: int = 20
+) -> Tuple[Image.Image, str]:
+    """
+    Set alpha to 0 on pixels whose RGB is within tolerance of key (L∞ norm).
+    Returns (RGBA image, err). err is "no_match" or "all_gone" or a user message, else "".
+    """
+    if np is None:  # pragma: no cover
+        return image, "no_numpy"
+    w0, h0 = image.size
+    if w0 < 1 or h0 < 1:
+        return image, "no_match"
+    kr, kg, kb = (max(0, min(255, int(key[0]))), max(0, min(255, int(key[1]))), max(0, min(255, int(key[2]))))
+    t = max(0, int(tolerance))
+    rgba = np.ascontiguousarray(
+        np.array(image.convert("RGBA"), dtype=np.uint8)
+    )
+    rgb = rgba[:, :, :3].astype(np.float32)
+    kf = np.array((kr, kg, kb), dtype=np.float32).reshape(1, 1, 3)
+    d = np.max(np.abs(rgb - kf), axis=2)
+    orig_a = rgba[:, :, 3].astype(np.uint8)
+    match = d <= float(t)
+    if not np.any(match):
+        return image, "no_match"
+    new_a = np.where(match, 0, orig_a)
+    if not np.any(new_a > 0):
+        return image, "all_gone"
+    out = rgba.copy()
+    out[:, :, 3] = new_a
+    if np.array_equal(rgba, out):
+        return image, "no_change"
+    return Image.fromarray(out, "RGBA"), ""
+
+
 class ImageSplitApp:
     PICK_PX = 8  # max distance in screen pixels to select a line
     # Excel-style "Insert Table" / contact sheet, max 10 in either dimension
@@ -662,7 +696,7 @@ class ImageSplitApp:
         self._img_y0: float = 0.0
         self.v_lines: List[int] = []
         self.h_lines: List[int] = []
-        self.mode = tk.StringVar(value="v")  # v, h, move, delete, circle, ignore
+        self.mode = tk.StringVar(value="v")  # v, h, move, delete, circle, ignore, keycolor
         self.ignored_cells: Set[Tuple[int, int]] = set()
         # (kind, current x or y in image space) — which line is being moved
         self._drag: Optional[Tuple[str, int]] = None
@@ -674,6 +708,8 @@ class ImageSplitApp:
         self.montage_table: bool = False
         self.montage_nrows: int = 3
         self.montage_ncols: int = 3
+        # chroma key: L∞ color distance; same scale as “crop to content” (0–255)
+        self._chroma_key_tolerance: int = 20
         # UI
         self._build_ui()
         self.canvas.bind("<Configure>", self._on_configure)
@@ -708,6 +744,9 @@ class ImageSplitApp:
         tools_menu.add_command(
             label="Crop to content (trim border)…", command=self._crop_to_content
         )
+        tools_menu.add_command(
+            label="Set color-key tolerance (match)…", command=self._chroma_key_tolerance_dialog
+        )
         tools_menu.add_command(label="Clear lines", command=self._clear_lines)
         tools_menu.add_command(label="Clear ignored tiles", command=self._clear_ignored)
         help_menu = tk.Menu(mbar, tearoff=0)
@@ -733,6 +772,7 @@ class ImageSplitApp:
             "Image Split",
             "Place vertical and horizontal cut lines, then export tiles. "
             "Crop to content (Tools) removes a big uniform border around a logo. "
+            "Key color (eyedropper) makes the clicked color transparent; adjust match tolerance in Tools. "
             "The Auto grid (table size in the toolbar) finds full-span light gaps. "
             "Use the View and Tools menus, or the toolbar: export format (PNG, JPEG, WebP) "
             "and quality or PNG compression, remembered separately per format. "
@@ -787,6 +827,12 @@ class ImageSplitApp:
         ).pack(side=tk.LEFT, padx=2)
         ttk.Radiobutton(
             bar, text="Ignore tile (click cell)", variable=self.mode, value="ignore"
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(
+            bar,
+            text="Key color → transparent (click)",
+            variable=self.mode,
+            value="keycolor",
         ).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(bar, text="Clear lines", command=self._clear_lines).pack(side=tk.LEFT, padx=4)
@@ -1141,6 +1187,9 @@ class ImageSplitApp:
         if m == "circle":
             self.canvas.config(cursor="cross")
             return
+        if m == "keycolor":
+            self.canvas.config(cursor="cross")
+            return
         if m == "ignore":
             self.canvas.config(cursor="target")
             return
@@ -1179,6 +1228,59 @@ class ImageSplitApp:
             return
 
         mode = self.mode.get()
+        if mode == "keycolor":
+            if np is None:
+                messagebox.showwarning(
+                    "Color key", "NumPy is required. Run: pip install numpy"
+                )
+                return
+            rgba0 = self.pil_image.convert("RGBA")
+            r_samp, g_samp, b_samp, a_samp = rgba0.getpixel((ix, iy))
+            if a_samp < 16:
+                messagebox.showinfo(
+                    "Color key",
+                    "This pixel is nearly or fully transparent. "
+                    "Click a solid part of the background to sample that color (not the logo).",
+                )
+                return
+            new_im, err = make_color_transparent(
+                self.pil_image, (r_samp, g_samp, b_samp), self._chroma_key_tolerance
+            )
+            if err == "all_gone":
+                messagebox.showwarning(
+                    "Color key",
+                    "That would make the whole image transparent. Lower the tolerance in Tools, "
+                    "or the logo may match the key color too closely (try a different key point on the background).",
+                )
+                return
+            if err == "no_match":
+                messagebox.showinfo(
+                    "Color key",
+                    "No pixels matched. Raise the color-key tolerance (Tools menu) or try another pixel on the background.",
+                )
+                return
+            if err == "no_change":
+                messagebox.showinfo(
+                    "Color key",
+                    "No change — the matching pixels are already fully transparent.",
+                )
+                return
+            if err:
+                if err == "no_numpy":
+                    messagebox.showwarning(
+                        "Color key", "NumPy is required. Run: pip install numpy"
+                    )
+                return
+            self.pil_image = new_im
+            self._rebuild_display()
+            self.status.config(
+                text=(
+                    f"Key color → transparent: RGB ({r_samp}, {g_samp}, {b_samp})  |  "
+                    f"tolerance {self._chroma_key_tolerance}"
+                )
+            )
+            return
+
         if mode == "circle":
             if not CIRCLE_EXTRACT_OK:
                 messagebox.showwarning(
@@ -1378,6 +1480,25 @@ class ImageSplitApp:
         self.status.config(
             text=f"Cropped: {old_w}×{old_h} → {new_w}×{new_h}  (border trimmed, margin {int(m)} px)"
         )
+
+    def _chroma_key_tolerance_dialog(self) -> None:
+        t = simpledialog.askinteger(
+            "Color-key tolerance",
+            "Each color channel: treat pixels within this distance of the key as matching "
+            "(0 = exact only; 20 = default, similar to “crop to content”). "
+            "Higher values remove a wider fringe of similar colors (e.g. off-white, JPEG).",
+            minvalue=0,
+            maxvalue=100,
+            initialvalue=self._chroma_key_tolerance,
+            parent=self.root,
+        )
+        if t is None:
+            return
+        self._chroma_key_tolerance = int(t)
+        if self.pil_image is not None:
+            self.status.config(
+                text=f"Color-key match tolerance: {self._chroma_key_tolerance} (per R, G, and B, max of the three).",
+            )
 
     def _clear_lines(self) -> None:
         self.montage_table = False
