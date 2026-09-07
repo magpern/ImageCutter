@@ -28,6 +28,29 @@ try:
 except ImportError:  # pragma: no cover
     np = None  # type: ignore
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+
+    DND_OK = True
+except ImportError:  # pragma: no cover
+    DND_OK = False
+    DND_FILES = None  # type: ignore[assignment]
+    TkinterDnD = None  # type: ignore[assignment]
+
+
+def load_image_file(path: str) -> Tuple[Optional[Image.Image], str]:
+    """Open and normalize an image file for editing. Returns (image, err); err is "" on success."""
+    try:
+        im = Image.open(path)
+        im.load()  # force decode now so a truncated/corrupt file raises here, not later
+    except OSError as err:
+        return None, str(err)
+    if im.mode == "P" and "transparency" in im.info:
+        im = im.convert("RGBA")
+    elif im.mode not in ("RGB", "RGBA", "L", "LA", "1"):
+        im = im.convert("RGB")
+    return im, ""
+
 
 def compute_tiles(
     image: Image.Image, vertical: List[int], horizontal: List[int]
@@ -129,13 +152,15 @@ def export_tiles(
     transparent_circle_cutout: bool = False,
     save_options: Optional[SaveExportOptions] = None,
     ignored: Optional[AbstractSet[Tuple[int, int]]] = None,
-) -> int:
+) -> Tuple[int, List[str]]:
+    """Returns (saved_count, errors); a per-tile save failure is collected, not raised."""
     eff = _effective_format_for_saving(file_format, transparent_circle_cutout)
     ext = _export_ext_for_format(eff)
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(basename or "image")[0]
     skip: AbstractSet[Tuple[int, int]] = ignored or frozenset()
     count = 0
+    errors: List[str] = []
     for tile, r, c in compute_tiles(image, vertical, horizontal):
         if (r, c) in skip:
             continue
@@ -145,9 +170,12 @@ def export_tiles(
             if t2 is not None:
                 out = t2
         p = os.path.join(out_dir, f"{stem}_r{r}_c{c}.{ext}")
-        save_tile_to_path(p, out, eff, save_options)
-        count += 1
-    return count
+        try:
+            save_tile_to_path(p, out, eff, save_options)
+            count += 1
+        except OSError as err:
+            errors.append(f"{os.path.basename(p)}: {err}")
+    return count, errors
 
 
 def _refine_runs_1d(mask: "np.ndarray", min_len: int) -> List[Tuple[int, int]]:
@@ -489,13 +517,15 @@ def export_tiles_montage(
     transparent_circle_cutout: bool = False,
     save_options: Optional[SaveExportOptions] = None,
     ignored: Optional[AbstractSet[Tuple[int, int]]] = None,
-) -> int:
+) -> Tuple[int, List[str]]:
+    """Returns (saved_count, errors); a per-tile save failure is collected, not raised."""
     eff = _effective_format_for_saving(file_format, transparent_circle_cutout)
     ext = _export_ext_for_format(eff)
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(basename or "image")[0]
     skip: AbstractSet[Tuple[int, int]] = ignored or frozenset()
     n = 0
+    errors: List[str] = []
     for tile, r, c in compute_tiles_montage(image, vertical, horizontal, nrows, ncols):
         if (r, c) in skip:
             continue
@@ -505,9 +535,39 @@ def export_tiles_montage(
             if t2 is not None:
                 out = t2
         p = os.path.join(out_dir, f"{stem}_r{r}_c{c}.{ext}")
-        save_tile_to_path(p, out, eff, save_options)
-        n += 1
-    return n
+        try:
+            save_tile_to_path(p, out, eff, save_options)
+            n += 1
+        except OSError as err:
+            errors.append(f"{os.path.basename(p)}: {err}")
+    return n, errors
+
+
+def convert_files(
+    paths: List[str],
+    file_format: str,
+    options: Optional[SaveExportOptions] = None,
+) -> Tuple[int, List[str]]:
+    """
+    Convert each image at `paths` to `file_format`, saving next to the source
+    file with the new extension (auto-save; no per-file dialog).
+    Returns (converted_count, errors); each error is "<basename>: <message>".
+    """
+    ext = _export_ext_for_format(file_format)
+    count = 0
+    errors: List[str] = []
+    for src in paths:
+        im, err = load_image_file(src)
+        if im is None:
+            errors.append(f"{os.path.basename(src)}: {err}")
+            continue
+        dst = f"{os.path.splitext(src)[0]}.{ext}"
+        try:
+            save_tile_to_path(dst, im, file_format, options)
+            count += 1
+        except OSError as save_err:
+            errors.append(f"{os.path.basename(src)}: {save_err}")
+    return count, errors
 
 
 def _composite_onto_white_for_analysis(src: Image.Image) -> Image.Image:
@@ -682,7 +742,7 @@ class ImageSplitApp:
     MAX_VIEW_PX = 12_000
 
     def __init__(self) -> None:
-        self.root = tk.Tk()
+        self.root = TkinterDnD.Tk() if DND_OK else tk.Tk()
         self.root.title("Image Split")
         self.root.minsize(800, 600)
         # State
@@ -721,6 +781,13 @@ class ImageSplitApp:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        if DND_OK:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self._on_drop)
+        else:
+            self.status.config(
+                text="Open an image to start. (Install tkinterdnd2 for drag-and-drop.)"
+            )
 
     def _build_menu(self) -> None:
         mbar = tk.Menu(self.root, tearoff=0)
@@ -728,6 +795,10 @@ class ImageSplitApp:
         mbar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Open image…", command=self._open, accelerator="Ctrl+O")
         file_menu.add_command(label="Export tiles…", command=self._export, accelerator="Ctrl+E")
+        file_menu.add_separator()
+        file_menu.add_command(
+            label="Convert files…", command=self._convert_files_dialog, accelerator="Ctrl+Shift+C"
+        )
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._quit, accelerator="Ctrl+Q")
         view_menu = tk.Menu(mbar, tearoff=0)
@@ -765,6 +836,7 @@ class ImageSplitApp:
 
         self.root.bind_all("<Control-o>", w(self._open))
         self.root.bind_all("<Control-e>", w(self._export))
+        self.root.bind_all("<Control-Shift-C>", w(self._convert_files_dialog))
         self.root.bind_all("<Control-q>", w(self._quit))
 
     def _about(self) -> None:
@@ -777,7 +849,9 @@ class ImageSplitApp:
             "Use the View and Tools menus, or the toolbar: export format (PNG, JPEG, WebP) "
             "and quality or PNG compression, remembered separately per format. "
             "Single circle exports use the PNG compression value. "
-            "Use Ignore tile (click cell) to mark tiles you do not want exported; they are hatched in the view.",
+            "Use Ignore tile (click cell) to mark tiles you do not want exported; they are hatched in the view. "
+            "Drag and drop one image to open it here, or several images to batch-convert them "
+            "(File > Convert files… works the same way, without drag-and-drop).",
         )
 
     def _quit(self) -> None:
@@ -793,6 +867,9 @@ class ImageSplitApp:
         bar.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(bar, text="Open image…", command=self._open).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(bar, text="Export tiles…", command=self._export).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bar, text="Convert files…", command=self._convert_files_dialog).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
         ttk.Label(bar, text="Format:").pack(side=tk.LEFT, padx=(4, 2))
         self._export_combo = ttk.Combobox(
             bar,
@@ -921,7 +998,8 @@ class ImageSplitApp:
             self._win_w // 2,
             self._win_h // 2,
             text="Open an image (File menu or toolbar), then add or auto-detect cut lines.\n"
-            "Drag in Move mode to adjust. Use the mouse wheel or View menu to zoom.",
+            "Drag in Move mode to adjust. Use the mouse wheel or View menu to zoom.\n"
+            "Or drop image file(s) here: one opens for editing, several open batch convert.",
             fill="#888",
             font=("Segoe UI", 12),
             justify=tk.CENTER,
@@ -1538,14 +1616,12 @@ class ImageSplitApp:
         )
         if not path:
             return
-        try:
-            im = Image.open(path)
-            if im.mode == "P" and "transparency" in im.info:
-                im = im.convert("RGBA")
-            elif im.mode not in ("RGB", "RGBA", "L", "LA", "1"):
-                im = im.convert("RGB")
-        except OSError as err:
-            messagebox.showerror("Open failed", str(err))
+        self._load_into_editor(path)
+
+    def _load_into_editor(self, path: str) -> None:
+        im, err = load_image_file(path)
+        if im is None:
+            messagebox.showerror("Open failed", err or "Could not open image.")
             return
         self.pil_image = im
         self._path = path
@@ -1557,6 +1633,141 @@ class ImageSplitApp:
         self.montage_table = False
         self.ignored_cells.clear()
         self._rebuild_display()
+
+    _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")
+
+    @staticmethod
+    def _parse_dnd_paths(data: str) -> List[str]:
+        """Parse a tkdnd drop payload into file paths (handles {C:\\a b\\x.png}-style groups)."""
+        paths: List[str] = []
+        buf = ""
+        in_brace = False
+        for ch in data:
+            if ch == "{":
+                in_brace = True
+                buf = ""
+            elif ch == "}":
+                in_brace = False
+                paths.append(buf)
+                buf = ""
+            elif ch == " " and not in_brace:
+                if buf:
+                    paths.append(buf)
+                    buf = ""
+            else:
+                buf += ch
+        if buf:
+            paths.append(buf)
+        return paths
+
+    def _on_drop(self, event: tk.Event) -> None:
+        paths = self._parse_dnd_paths(str(getattr(event, "data", "")))
+        images = [
+            p for p in paths if os.path.splitext(p)[1].lower() in self._IMAGE_EXTS and os.path.isfile(p)
+        ]
+        if not images:
+            messagebox.showinfo("Drop", "No image files were found in the dropped item(s).")
+            return
+        if len(images) == 1:
+            self._load_into_editor(images[0])
+        else:
+            self._convert_files_dialog(preselected=images)
+
+    def _convert_files_dialog(self, preselected: Optional[List[str]] = None) -> None:
+        paths: List[str] = preselected if preselected else []
+        if not paths:
+            picked = filedialog.askopenfilenames(
+                title="Convert images…",
+                filetypes=[
+                    ("Images", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff"),
+                    ("All", "*.*"),
+                ],
+            )
+            paths = list(picked)
+        if not paths:
+            return
+        choice = self._ask_convert_format()
+        if choice is None:
+            return
+        fmt, options = choice
+        n, errors = convert_files(paths, fmt, options)
+        ext = _export_ext_for_format(fmt)
+        note = ""
+        if errors:
+            shown = "\n".join(errors[:5])
+            more = f"\n(+{len(errors) - 5} more)" if len(errors) > 5 else ""
+            note = f"\n\n{len(errors)} file(s) failed:\n{shown}{more}"
+        messagebox.showinfo(
+            "Convert files",
+            f"Converted {n} of {len(paths)} file(s) to .{ext} (saved next to each source file).{note}",
+        )
+
+    def _ask_convert_format(self) -> Optional[Tuple[str, SaveExportOptions]]:
+        """Small modal: pick an output format + quality. Returns (format, options), or None if cancelled."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Convert to…")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        fmt_var = tk.StringVar(value="PNG")
+        q_var = tk.IntVar(value=90)
+        result: Dict[str, object] = {}
+
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="Output format:").grid(row=0, column=0, sticky=tk.W, pady=(0, 6))
+        combo = ttk.Combobox(
+            frm, textvariable=fmt_var, state="readonly", width=10, values=("PNG", "JPEG", "WebP")
+        )
+        combo.grid(row=0, column=1, sticky=tk.W, pady=(0, 6))
+        q_label = ttk.Label(frm, text="Quality:")
+        q_label.grid(row=1, column=0, sticky=tk.W)
+        q_spin = ttk.Spinbox(frm, textvariable=q_var, width=6, from_=0, to=100)
+        q_spin.grid(row=1, column=1, sticky=tk.W)
+
+        def sync_quality(_e: Optional[tk.Event] = None) -> None:
+            f = fmt_var.get()
+            if f == "PNG":
+                q_label.config(text="Compression (0–9):")
+                q_spin.config(from_=0, to=9)
+                if q_var.get() > 9:
+                    q_var.set(6)
+            elif f == "JPEG":
+                q_label.config(text="Quality (1–100):")
+                q_spin.config(from_=1, to=100)
+                if q_var.get() < 1:
+                    q_var.set(92)
+            else:
+                q_label.config(text="Quality (0–100):")
+                q_spin.config(from_=0, to=100)
+
+        combo.bind("<<ComboboxSelected>>", sync_quality)
+        sync_quality()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=2, column=0, columnspan=2, pady=(12, 0), sticky=tk.E)
+
+        def on_ok() -> None:
+            result["fmt"] = fmt_var.get()
+            result["q"] = int(q_var.get())
+            dlg.destroy()
+
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btns, text="Convert", command=on_ok).pack(side=tk.RIGHT)
+
+        dlg.wait_window()
+        if "fmt" not in result:
+            return None
+        fmt_key = {"PNG": "png", "JPEG": "jpeg", "WebP": "webp"}[str(result["fmt"])]
+        q = int(result["q"])  # type: ignore[arg-type]
+        if fmt_key == "png":
+            opts = SaveExportOptions(png_compress=self._clamp_int(q, 0, 9))
+        elif fmt_key == "jpeg":
+            opts = SaveExportOptions(jpeg_quality=self._clamp_int(q, 1, 100))
+        else:
+            opts = SaveExportOptions(webp_quality=self._clamp_int(q, 0, 100))
+        return fmt_key, opts
 
     def _export_file_format(self) -> str:
         m = {"PNG": "png", "JPEG": "jpeg", "WEBP": "webp"}
@@ -1650,7 +1861,7 @@ class ImageSplitApp:
         ign = frozenset(self.ignored_cells)
         try:
             if self.montage_table and self._montage_gutter_shape_ok():
-                n = export_tiles_montage(
+                n, errors = export_tiles_montage(
                     self.pil_image,
                     self.v_lines,
                     self.h_lines,
@@ -1664,7 +1875,7 @@ class ImageSplitApp:
                     ignored=ign,
                 )
             else:
-                n = export_tiles(
+                n, errors = export_tiles(
                     self.pil_image,
                     self.v_lines,
                     self.h_lines,
@@ -1676,13 +1887,17 @@ class ImageSplitApp:
                     ignored=ign,
                 )
         except OSError as err:
-            messagebox.showerror("Export failed", str(err))
+            messagebox.showerror("Export failed", f"Could not create the export folder:\n{err}")
             return
         note = ""
         if tc and (fmt or "").lower() in ("jpg", "jpeg", "jpe"):
             note = "\n\n(Transparent cutouts are saved as PNG; JPEG has no alpha channel.)"
         if n_skip:
             note += f"\n\n({n_skip} tile(s) marked ignored were not exported; click them again in Ignore mode to unmark.)"
+        if errors:
+            shown = "\n".join(errors[:5])
+            more = f"\n(+{len(errors) - 5} more)" if len(errors) > 5 else ""
+            note += f"\n\n{len(errors)} tile(s) failed to save:\n{shown}{more}"
         messagebox.showinfo("Export", f"Wrote {n} .{ext} file(s) to:\n{d}{note}")
 
     def run(self) -> None:
