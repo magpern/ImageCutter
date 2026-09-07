@@ -845,8 +845,8 @@ class ImageSplitApp:
             "Place vertical and horizontal cut lines, then export tiles. "
             "Crop to content (Tools) removes a big uniform border around a logo. "
             "Key color (eyedropper) makes the clicked color transparent; adjust match tolerance in Tools. "
-            "The Auto grid (table size in the toolbar) finds full-span light gaps. "
-            "Use the View and Tools menus, or the toolbar: export format (PNG, JPEG, WebP) "
+            "The Auto grid (table size in the sidebar) finds full-span light gaps. "
+            "Use the View and Tools menus, or the sidebar: export format (PNG, JPEG, WebP) "
             "and quality or PNG compression, remembered separately per format. "
             "Single circle exports use the PNG compression value. "
             "Use Ignore tile (click cell) to mark tiles you do not want exported; they are hatched in the view. "
@@ -857,117 +857,199 @@ class ImageSplitApp:
     def _quit(self) -> None:
         self.root.destroy()
 
+    SIDEBAR_WIDTH = 230
+
+    def _make_section(self, parent: tk.Widget, title: str, start_open: bool = True) -> ttk.Frame:
+        """A collapsible sidebar section. Returns the body frame to pack content into."""
+        outer = ttk.Frame(parent)
+        outer.pack(fill=tk.X, pady=(0, 6))
+        body = ttk.Frame(outer, padding=(10, 6, 10, 10))
+        state = {"open": start_open}
+
+        def toggle() -> None:
+            state["open"] = not state["open"]
+            header_btn.config(text=f"{'▾' if state['open'] else '▸'}  {title}")
+            if state["open"]:
+                body.pack(fill=tk.X)
+            else:
+                body.pack_forget()
+
+        header_btn = ttk.Label(
+            outer,
+            text=f"{'▾' if start_open else '▸'}  {title}",
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+            padding=(2, 4),
+        )
+        header_btn.pack(fill=tk.X)
+        header_btn.bind("<Button-1>", lambda _e: toggle())
+        if start_open:
+            body.pack(fill=tk.X)
+        ttk.Separator(outer, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(4, 0))
+        return body
+
+    def _is_in_sidebar(self, widget: object) -> bool:
+        sc = getattr(self, "_sidebar_canvas", None)
+        if sc is None or widget is None:
+            return False
+        return str(widget).startswith(str(sc))
+
     def _build_ui(self) -> None:
-        self._export_format = tk.StringVar(value="PNG")
+        self._export_format = tk.StringVar(value="WebP")
         self._build_menu()
-        main = ttk.Frame(self.root, padding=6)
+
+        self.root.geometry("1180x760")
+        self.root.minsize(880, 600)
+
+        main = ttk.Frame(self.root, padding=8)
         main.pack(fill=tk.BOTH, expand=True)
 
-        bar = ttk.Frame(main)
-        bar.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(bar, text="Open image…", command=self._open).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(bar, text="Export tiles…", command=self._export).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(bar, text="Convert files…", command=self._convert_files_dialog).pack(
-            side=tk.LEFT, padx=(0, 8)
+        self.status = ttk.Label(main, text="Open an image to start.")
+        self.status.pack(anchor=tk.W, side=tk.BOTTOM, pady=(6, 0))
+
+        paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        sidebar_outer = ttk.Frame(paned)
+        paned.add(sidebar_outer, weight=0)
+        cframe = ttk.Frame(paned)
+        paned.add(cframe, weight=1)
+
+        sidebar_canvas = tk.Canvas(sidebar_outer, width=self.SIDEBAR_WIDTH, highlightthickness=0)
+        sidebar_scroll = ttk.Scrollbar(
+            sidebar_outer, orient=tk.VERTICAL, command=sidebar_canvas.yview
         )
-        ttk.Label(bar, text="Format:").pack(side=tk.LEFT, padx=(4, 2))
+        sidebar_canvas.configure(yscrollcommand=sidebar_scroll.set)
+        sidebar_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sidebar_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._sidebar_canvas = sidebar_canvas
+
+        sidebar = ttk.Frame(sidebar_canvas)
+        sidebar_window = sidebar_canvas.create_window((0, 0), window=sidebar, anchor="nw")
+
+        def _sync_sidebar_scrollregion(_evt: Optional[tk.Event] = None) -> None:
+            sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+
+        def _sync_sidebar_width(evt: tk.Event) -> None:
+            sidebar_canvas.itemconfigure(sidebar_window, width=evt.width)
+
+        sidebar.bind("<Configure>", _sync_sidebar_scrollregion)
+        sidebar_canvas.bind("<Configure>", _sync_sidebar_width)
+
+        # --- File ---
+        file_box = self._make_section(sidebar, "File")
+        ttk.Button(file_box, text="Open image…", command=self._open).pack(fill=tk.X, pady=2)
+        ttk.Button(file_box, text="Export tiles…", command=self._export).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            file_box, text="Convert files…", command=self._convert_files_dialog
+        ).pack(fill=tk.X, pady=2)
+
+        # --- Edit mode (drawing tool) ---
+        mode_box = self._make_section(sidebar, "Edit mode")
+        for label, value in (
+            ("Add vertical line", "v"),
+            ("Add horizontal line", "h"),
+            ("Move line", "move"),
+            ("Delete (click line)", "delete"),
+            ("Extract circle (click cell)", "circle"),
+            ("Ignore tile (click cell)", "ignore"),
+            ("Key color → transparent", "keycolor"),
+        ):
+            ttk.Radiobutton(mode_box, text=label, variable=self.mode, value=value).pack(
+                anchor=tk.W, pady=1
+            )
+        ttk.Button(mode_box, text="Clear lines", command=self._clear_lines).pack(
+            fill=tk.X, pady=(6, 0)
+        )
+        ttk.Button(mode_box, text="Clear ignored tiles", command=self._clear_ignored).pack(
+            fill=tk.X, pady=(2, 0)
+        )
+
+        # --- Grid & table ---
+        grid_box = self._make_section(sidebar, "Grid & table")
+        tr = tuple(str(i) for i in range(1, self.TABLE_DIM_MAX + 1))
+        self._table_rows = tk.StringVar(value="3")
+        self._table_cols = tk.StringVar(value="3")
+        dims_row = ttk.Frame(grid_box)
+        dims_row.pack(fill=tk.X)
+        ttk.Label(dims_row, text="Rows").pack(side=tk.LEFT)
+        self._table_row_combo = ttk.Combobox(
+            dims_row, textvariable=self._table_rows, state="readonly", width=3, values=tr
+        )
+        self._table_row_combo.pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(dims_row, text="Cols").pack(side=tk.LEFT)
+        self._table_col_combo = ttk.Combobox(
+            dims_row, textvariable=self._table_cols, state="readonly", width=3, values=tr
+        )
+        self._table_col_combo.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(
+            grid_box, text="Auto grid (gaps)…", command=self._auto_montage_gutters
+        ).pack(fill=tk.X, pady=(6, 2))
+        ttk.Button(
+            grid_box, text="Crop to content…", command=self._crop_to_content
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            grid_box, text="Color-key tolerance…", command=self._chroma_key_tolerance_dialog
+        ).pack(fill=tk.X, pady=2)
+
+        # --- Export settings ---
+        export_box = self._make_section(sidebar, "Export settings")
+        fmt_row = ttk.Frame(export_box)
+        fmt_row.pack(fill=tk.X)
+        ttk.Label(fmt_row, text="Format").pack(side=tk.LEFT)
         self._export_combo = ttk.Combobox(
-            bar,
+            fmt_row,
             textvariable=self._export_format,
             state="readonly",
             width=8,
             values=("PNG", "JPEG", "WebP"),
         )
-        self._export_combo.pack(side=tk.LEFT, padx=(0, 4))
-        self._export_transparent_circles = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            bar,
-            text="Export: round cutout (transparent)",
-            variable=self._export_transparent_circles,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Radiobutton(
-            bar, text="Add vertical", variable=self.mode, value="v"
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Radiobutton(
-            bar, text="Add horizontal", variable=self.mode, value="h"
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Radiobutton(
-            bar, text="Move", variable=self.mode, value="move"
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Radiobutton(
-            bar, text="Delete (click line)", variable=self.mode, value="delete"
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Radiobutton(
-            bar, text="Extract circle (click cell)", variable=self.mode, value="circle"
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Radiobutton(
-            bar, text="Ignore tile (click cell)", variable=self.mode, value="ignore"
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Radiobutton(
-            bar,
-            text="Key color → transparent (click)",
-            variable=self.mode,
-            value="keycolor",
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(bar, text="Clear lines", command=self._clear_lines).pack(side=tk.LEFT, padx=4)
-        ttk.Label(bar, text="Table:").pack(side=tk.LEFT, padx=(4, 0))
-        tr = tuple(str(i) for i in range(1, self.TABLE_DIM_MAX + 1))
-        self._table_rows = tk.StringVar(value="3")
-        ttk.Label(bar, text="Rows", foreground="gray").pack(side=tk.LEFT, padx=(4, 2))
-        self._table_row_combo = ttk.Combobox(
-            bar, textvariable=self._table_rows, state="readonly", width=3, values=tr
-        )
-        self._table_row_combo.pack(side=tk.LEFT, padx=0)
-        ttk.Label(bar, text="×", foreground="gray").pack(side=tk.LEFT, padx=2)
-        self._table_cols = tk.StringVar(value="3")
-        ttk.Label(bar, text="Cols", foreground="gray").pack(side=tk.LEFT, padx=0)
-        self._table_col_combo = ttk.Combobox(
-            bar, textvariable=self._table_cols, state="readonly", width=3, values=tr
-        )
-        self._table_col_combo.pack(side=tk.LEFT, padx=0)
-        ttk.Button(bar, text="Auto grid (gaps)…", command=self._auto_montage_gutters).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-        ttk.Button(
-            bar, text="Crop to content", command=self._crop_to_content
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Label(bar, text="Zoom:").pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Button(bar, text="−", width=3, command=lambda: self._bump_zoom(1.0 / self.WHEEL_ZOOM)).pack(
-            side=tk.LEFT, padx=1
-        )
-        ttk.Button(bar, text="+", width=3, command=lambda: self._bump_zoom(self.WHEEL_ZOOM)).pack(
-            side=tk.LEFT, padx=1
-        )
-        ttk.Button(bar, text="Fit to window", command=self._fit_view).pack(side=tk.LEFT, padx=6)
-        ttk.Label(bar, text="(Scroll wheel to zoom, scrollbars to pan when zoomed.)", foreground="gray").pack(
-            side=tk.LEFT, padx=12
-        )
+        self._export_combo.pack(side=tk.LEFT, padx=(4, 0))
 
         self._quality_mem: Dict[str, int] = {"png": 6, "jpeg": 92, "webp": 90}
         self._prev_file_fmt: Optional[str] = None
         self._export_quality = tk.IntVar(value=6)
-        qbar = ttk.Frame(main)
-        qbar.pack(fill=tk.X, pady=(0, 2))
-        self._q_label = ttk.Label(qbar, text="")
-        self._q_label.pack(side=tk.LEFT, padx=(0, 6))
-        self._q_spin = ttk.Spinbox(qbar, textvariable=self._export_quality, width=5)
-        self._q_spin.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(
-            qbar, text="(value remembered for each format)", foreground="gray"
-        ).pack(side=tk.LEFT, padx=(0, 0))
+        q_row = ttk.Frame(export_box)
+        q_row.pack(fill=tk.X, pady=(6, 0))
+        self._q_label = ttk.Label(q_row, text="")
+        self._q_label.pack(side=tk.LEFT)
+        self._q_spin = ttk.Spinbox(q_row, textvariable=self._export_quality, width=5)
+        self._q_spin.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(export_box, text="(remembered per format)", foreground="gray").pack(
+            anchor=tk.W, pady=(2, 0)
+        )
+
+        self._export_transparent_circles = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            export_box,
+            text="Round cutout (transparent)",
+            variable=self._export_transparent_circles,
+        ).pack(anchor=tk.W, pady=(8, 0))
         self._export_combo.bind("<<ComboboxSelected>>", self._on_export_format_changed)
+
+        # --- View ---
+        view_box = self._make_section(sidebar, "View", start_open=False)
+        zoom_row = ttk.Frame(view_box)
+        zoom_row.pack(fill=tk.X)
+        ttk.Button(
+            zoom_row, text="−", width=3, command=lambda: self._bump_zoom(1.0 / self.WHEEL_ZOOM)
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            zoom_row, text="+", width=3, command=lambda: self._bump_zoom(self.WHEEL_ZOOM)
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(zoom_row, text="Fit to window", command=self._fit_view).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        ttk.Label(
+            view_box,
+            text="Scroll wheel to zoom, scrollbars to pan when zoomed.",
+            foreground="gray",
+            wraplength=self.SIDEBAR_WIDTH - 20,
+        ).pack(anchor=tk.W, pady=(6, 0))
+
         self._on_export_format_changed()
 
-        self.status = ttk.Label(main, text="Open an image to start.")
-        self.status.pack(anchor=tk.W, pady=(0, 4))
-
         # Canvas in a frame for border
-        cframe = ttk.Frame(main)
-        cframe.pack(fill=tk.BOTH, expand=True)
         self.canvas = tk.Canvas(cframe, background="#2d2d2d", highlightthickness=0)
         self._vscroll = ttk.Scrollbar(cframe, orient=tk.VERTICAL, command=self.canvas.yview)
         self._hscroll = ttk.Scrollbar(cframe, orient=tk.HORIZONTAL, command=self.canvas.xview)
@@ -997,7 +1079,7 @@ class ImageSplitApp:
         self.canvas.create_text(
             self._win_w // 2,
             self._win_h // 2,
-            text="Open an image (File menu or toolbar), then add or auto-detect cut lines.\n"
+            text="Open an image (File menu or sidebar), then add or auto-detect cut lines.\n"
             "Drag in Move mode to adjust. Use the mouse wheel or View menu to zoom.\n"
             "Or drop image file(s) here: one opens for editing, several open batch convert.",
             fill="#888",
@@ -1116,9 +1198,14 @@ class ImageSplitApp:
         return 1.0 / ImageSplitApp.WHEEL_ZOOM
 
     def _on_wheel(self, e: tk.Event) -> str | None:
+        t = self.root.winfo_containing(e.x_root, e.y_root)
+        if self._is_in_sidebar(t):
+            f = self._parse_wheel(e)
+            if f is not None:
+                self._sidebar_canvas.yview_scroll(-1 if f > 1.0 else 1, "units")
+            return "break" if sys.platform == "win32" else None
         if self.pil_image is None:
             return None
-        t = self.root.winfo_containing(e.x_root, e.y_root)
         if t is not self.canvas and e.widget is not self.canvas:
             return None
         f = self._parse_wheel(e)
