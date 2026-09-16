@@ -55,7 +55,7 @@ The workflow **Build binaries** (`.github/workflows/build-binaries.yml`) runs on
 
 - **Open** an image, **add vertical / horizontal lines** (or **move** / **delete** them).
 - **Zoom** (wheel and toolbar), **pan** with scrollbars when zoomed, **fit to window**.
-- **Export tiles** to a folder as **PNG**, **JPEG**, or **WebP**, with **quality / compression** options (remembered per format).
+- **Export tiles** to a folder as **PNG**, **JPEG**, **WebP**, or **AVIF**, with **quality / compression** options (remembered per format).
 - **Table (white gap) grid**: choose **rows × columns** (1–10 each), then **Auto grid (gaps)…** to detect full-span near-white gutters and place lines so export skips the gaps (montage / contact-sheet layout).
 - **Export: round cutout (transparent)**: batch-export each tile as a circular cutout with transparency where supported (JPEG is upgraded to PNG when transparency is required).
 - **Extract circle (click cell)**: single-tile PNG with a soft circular alpha mask (requires OpenCV).

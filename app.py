@@ -76,10 +76,11 @@ class SaveExportOptions:
     jpeg_quality: int = 92  # 1–100
     webp_quality: int = 90  # 0–100
     webp_method: int = 6  # 0=fast / 6=slow-smaller; Pillow WebP
+    avif_quality: int = 80  # 0–100
     png_compress: int = 6  # 0–9
 
 
-# Export: "png" | "jpeg" | "webp" (lowercase)
+# Export: "png" | "jpeg" | "webp" | "avif" (lowercase)
 def _tile_for_jpeg(im: Image.Image) -> Image.Image:
     if im.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", im.size, (255, 255, 255))
@@ -101,7 +102,7 @@ def save_tile_to_path(
     file_format: str,
     options: Optional[SaveExportOptions] = None,
 ) -> None:
-    """file_format: png | jpeg | webp. Optional encoding options (defaults are reasonable)."""
+    """file_format: png | jpeg | webp | avif. Optional encoding options (defaults are reasonable)."""
     o = options or SaveExportOptions()
     f = (file_format or "png").lower()
     if f in ("jpg", "jpeg", "jpe"):
@@ -113,6 +114,9 @@ def save_tile_to_path(
         q = max(0, min(100, int(o.webp_quality)))
         m = max(0, min(6, int(o.webp_method)))
         tile.save(path, format="WEBP", quality=q, method=m)
+    elif f == "avif":
+        q = max(0, min(100, int(o.avif_quality)))
+        tile.save(path, format="AVIF", quality=q)
     else:
         t = tile
         if t.mode == "P" and "transparency" in t.info:
@@ -127,6 +131,8 @@ def _export_ext_for_format(file_format: str) -> str:
         return "jpg"
     if f == "webp":
         return "webp"
+    if f == "avif":
+        return "avif"
     return "png"
 
 
@@ -846,7 +852,7 @@ class ImageSplitApp:
             "Crop to content (Tools) removes a big uniform border around a logo. "
             "Key color (eyedropper) makes the clicked color transparent; adjust match tolerance in Tools. "
             "The Auto grid (table size in the sidebar) finds full-span light gaps. "
-            "Use the View and Tools menus, or the sidebar: export format (PNG, JPEG, WebP) "
+            "Use the View and Tools menus, or the sidebar: export format (PNG, JPEG, WebP, AVIF) "
             "and quality or PNG compression, remembered separately per format. "
             "Single circle exports use the PNG compression value. "
             "Use Ignore tile (click cell) to mark tiles you do not want exported; they are hatched in the view. "
@@ -1002,11 +1008,11 @@ class ImageSplitApp:
             textvariable=self._export_format,
             state="readonly",
             width=8,
-            values=("PNG", "JPEG", "WebP"),
+            values=("PNG", "JPEG", "WebP", "AVIF"),
         )
         self._export_combo.pack(side=tk.LEFT, padx=(4, 0))
 
-        self._quality_mem: Dict[str, int] = {"png": 6, "jpeg": 92, "webp": 90}
+        self._quality_mem: Dict[str, int] = {"png": 6, "jpeg": 92, "webp": 90, "avif": 80}
         self._prev_file_fmt: Optional[str] = None
         self._export_quality = tk.IntVar(value=6)
         q_row = ttk.Frame(export_box)
@@ -1697,7 +1703,7 @@ class ImageSplitApp:
         path = filedialog.askopenfilename(
             title="Open image",
             filetypes=[
-                ("Images", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff"),
+                ("Images", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.avif;*.tif;*.tiff"),
                 ("All", "*.*"),
             ],
         )
@@ -1721,7 +1727,7 @@ class ImageSplitApp:
         self.ignored_cells.clear()
         self._rebuild_display()
 
-    _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")
+    _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".avif", ".tif", ".tiff")
 
     @staticmethod
     def _parse_dnd_paths(data: str) -> List[str]:
@@ -1766,7 +1772,7 @@ class ImageSplitApp:
             picked = filedialog.askopenfilenames(
                 title="Convert images…",
                 filetypes=[
-                    ("Images", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff"),
+                    ("Images", "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.avif;*.tif;*.tiff"),
                     ("All", "*.*"),
                 ],
             )
@@ -1805,7 +1811,11 @@ class ImageSplitApp:
         frm.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frm, text="Output format:").grid(row=0, column=0, sticky=tk.W, pady=(0, 6))
         combo = ttk.Combobox(
-            frm, textvariable=fmt_var, state="readonly", width=10, values=("PNG", "JPEG", "WebP")
+            frm,
+            textvariable=fmt_var,
+            state="readonly",
+            width=10,
+            values=("PNG", "JPEG", "WebP", "AVIF"),
         )
         combo.grid(row=0, column=1, sticky=tk.W, pady=(0, 6))
         q_label = ttk.Label(frm, text="Quality:")
@@ -1846,18 +1856,22 @@ class ImageSplitApp:
         dlg.wait_window()
         if "fmt" not in result:
             return None
-        fmt_key = {"PNG": "png", "JPEG": "jpeg", "WebP": "webp"}[str(result["fmt"])]
+        fmt_key = {"PNG": "png", "JPEG": "jpeg", "WebP": "webp", "AVIF": "avif"}[
+            str(result["fmt"])
+        ]
         q = int(result["q"])  # type: ignore[arg-type]
         if fmt_key == "png":
             opts = SaveExportOptions(png_compress=self._clamp_int(q, 0, 9))
         elif fmt_key == "jpeg":
             opts = SaveExportOptions(jpeg_quality=self._clamp_int(q, 1, 100))
+        elif fmt_key == "avif":
+            opts = SaveExportOptions(avif_quality=self._clamp_int(q, 0, 100))
         else:
             opts = SaveExportOptions(webp_quality=self._clamp_int(q, 0, 100))
         return fmt_key, opts
 
     def _export_file_format(self) -> str:
-        m = {"PNG": "png", "JPEG": "jpeg", "WEBP": "webp"}
+        m = {"PNG": "png", "JPEG": "jpeg", "WEBP": "webp", "AVIF": "avif"}
         k = (self._export_format.get() or "PNG").strip().upper()
         if k in ("JPG", "JPEG", "JPE"):
             k = "JPEG"
@@ -1914,6 +1928,9 @@ class ImageSplitApp:
         elif new == "jpeg":
             self._q_label.config(text="JPEG quality (1–100):")
             self._q_spin.config(from_=1, to=100, increment=1)
+        elif new == "avif":
+            self._q_label.config(text="AVIF quality (0–100):")
+            self._q_spin.config(from_=0, to=100, increment=1)
         else:
             self._q_label.config(text="WebP quality (0–100):")
             self._q_spin.config(from_=0, to=100, increment=1)
@@ -1922,10 +1939,12 @@ class ImageSplitApp:
         self._flush_current_quality_to_mem()
         j = int(self._quality_mem.get("jpeg", 92))
         wq = int(self._quality_mem.get("webp", 90))
+        aq = int(self._quality_mem.get("avif", 80))
         pc = int(self._quality_mem.get("png", 6))
         return SaveExportOptions(
             jpeg_quality=self._clamp_int(j, 1, 100),
             webp_quality=self._clamp_int(wq, 0, 100),
+            avif_quality=self._clamp_int(aq, 0, 100),
             png_compress=self._clamp_int(pc, 0, 9),
             webp_method=6,
         )
